@@ -9,6 +9,14 @@ cd <workspace>
 ./run_x5a_vision_pick.sh
 ```
 
+选择方块颜色（默认 `red`）：
+
+```bash
+./run_x5a_vision_pick.sh --color red
+./run_x5a_vision_pick.sh --color white
+./run_x5a_vision_pick.sh --color orange
+```
+
 仅视觉测试：
 
 ```bash
@@ -18,14 +26,14 @@ cd <workspace>
 只规划不执行：
 
 ```bash
-./run_x5a_vision_pick.sh --dry-run
+./run_x5a_vision_pick.sh --dry-run --color orange
 ```
 
 脚本会自动 source ROS/厂商/项目环境，复用健康的既有节点，并依次检查 CAN、真实关节反馈、MoveIt actions、RealSense 消息、Eye-to-Hand TF 和稳定视觉坐标。默认只执行一次，放置并回 Home 后退出。详细日志保存在 `logs/run_YYYYMMDD_HHMMSS/`。
 
 ## 项目简介
 
-这是一个在真实 ARX X5A 上完成验证的 ROS 2 Humble 项目，使用 MoveIt 2、Intel RealSense RGB-D 和 Eye-to-Hand 手眼标定，实现视觉定位、抓取、固定位置放置及回 Home。
+这是一个在真实 ARX X5A 上运行的 ROS 2 Humble 项目，使用 MoveIt 2、Intel RealSense RGB-D 和 Eye-to-Hand 手眼标定，实现视觉定位、抓取、视觉目标放置及回 Home。
 
 当前稳定版本已经在两个 XY 距离约 0.174 m 的明显不同位置完成真实视觉抓取：
 
@@ -46,7 +54,8 @@ VISION CLOSED LOOP VERIFIED
 - 标准 `control_msgs/action/GripperCommand` 夹爪控制
 - 固定坐标 Pick & Place
 - ChArUco Eye-to-Hand 标定与 TF 发布
-- RealSense aligned RGB-D 红色方块定位
+- RealSense aligned RGB-D 红、白、橙三色方块独立定位
+- 黑色海绵区域中心定位，作为可移动放置目标
 - 视觉坐标冻结、Cartesian approach/lift/descend/retreat 和 Pose planning fallback
 - 两个不同位置的真实视觉 Pick & Place 闭环验证
 
@@ -58,7 +67,7 @@ VISION CLOSED LOOP VERIFIED
 RealSense
    |
    v
-x5a_vision -- /x5a_vision/object_pose
+x5a_vision -- selected cube pose + /x5a_vision/box_pose
    |
    v
 TF2 / Eye-to-Hand
@@ -109,7 +118,7 @@ X5A -> CAN -> X5Controller -> /arm_status (RobotStatus)
 | `x5a_moveit_config` | MoveIt 2 模型、规划参数、控制器映射、真机 bringup |
 | `x5a_moveit_official_adapter` | `/arm_status` 状态适配，FJT/Gripper action 到官方 `/arm_cmd` |
 | `x5a_pick_place` | 固定坐标和视觉抓放状态机、Planning Scene、执行与回 Home |
-| `x5a_vision` | HSV + RGB-D + TF2 的红色方块定位和稳定滤波 |
+| `x5a_vision` | HSV + RGB-D + TF2 的红/白/橙方块及黑色海绵中心定位 |
 | `x5a_handeye` | ChArUco 检测、采样、Eye-to-Hand 求解、验证与 TF 发布 |
 | `x5a_control_bridge` | 早期实验 bridge；稳定真机链不启动 |
 
@@ -207,9 +216,10 @@ ros2 launch x5a_pick_place pick_place.launch.py \
 - Board：ChArUco，`DICT_4X4_50`，5 x 7
 - square：0.020 m
 - marker：0.014 m
-- Solver：DANIILIDIS
-- Hold-out mean：4.856 mm
-- Hold-out max：6.930 mm
+- Solver：PARK
+- Samples：33
+- Hold-out mean：7.67 mm
+- Hold-out max：14.07 mm
 - 变换：`T_base_camera_color_optical`
 - 标定 verdict：PASS
 
@@ -217,7 +227,7 @@ ros2 launch x5a_pick_place pick_place.launch.py \
 
 ## Visual Pick & Place
 
-稳定版使用 15 帧 median/std 过滤；检测稳定后冻结目标位置，本轮运动期间不再跟随视觉漂移。两个真实验证位置约为：
+稳定版使用 15 帧 median/std 过滤；检测稳定后同时冻结所选方块和黑色海绵中心，本轮运动期间不再跟随视觉漂移。红色视觉抓放基线曾在两个不同位置完成闭环验证：
 
 ```text
 position 1: base XY ~= [0.2140, 0.1755] m
@@ -250,5 +260,7 @@ VISION CLOSED LOOP VERIFIED
 - X5A joint limits 中部分来自 X5 software limits，并结合本机可达性做了限制；不等于完整机械范围认证。
 - 当前正式 bridge 是项目实现的 `FollowJointTrajectory` / `GripperCommand` 到 ARX `RobotCmd` 适配器。
 - 当前不是完整的 `ros2_control` `HardwareInterface`。
+- 三色方块和可移动黑色海绵目标已经完成检测、坐标冻结和完整 dry-run；部分位置已完成真实放置。
+- 携物跨侧移动到部分盒子位置时，`MOVE_PRE_PLACE` 仍可能被 OMPL 以 `Unable to sample any valid states for goal tree` 拒绝。当前实现会预求解一个 IK 关节分支，该分支规划失败后尚未继续搜索其他 Pose Goal IK 分支；这是当前待修问题，不代表视觉坐标错误。
 - 相机 serial number 在 `x5a_vision/launch/vision.launch.py` 中按本机 D435i 配置；更换相机时需更新或参数化。
 - 真机操作必须由熟悉机械臂、CAN 和急停流程的人员现场监护。

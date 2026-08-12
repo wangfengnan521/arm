@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""HSV + aligned-depth cube localization with TF2 and temporal stability."""
+"""Multi-color RGB-D cube localization and movable-box localization."""
 from __future__ import annotations
 
+import math
 import threading
 from collections import deque
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -12,6 +13,7 @@ import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PointStamped, PoseStamped
 from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
@@ -19,6 +21,14 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Bool
 from tf2_geometry_msgs import do_transform_point
 from tf2_ros import Buffer, TransformException, TransformListener
+
+
+COLORS = ("red", "white", "orange")
+DRAW_COLORS = {
+    "red": (0, 0, 255),
+    "white": (255, 255, 255),
+    "orange": (0, 140, 255),
+}
 
 
 class CubeDetector(Node):
@@ -30,21 +40,57 @@ class CubeDetector(Node):
         self.lock = threading.Lock()
         self.color_msg: Optional[Image] = None
         self.info: Optional[CameraInfo] = None
-        self.history = deque(maxlen=self.window)
+        self.histories = {name: deque(maxlen=self.window) for name in COLORS}
+        self.box_history = deque(maxlen=self.box_window)
         self.last_log_ns = 0
         self.depth_encoding_logged = False
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.point_pub = self.create_publisher(PointStamped, "/x5a_vision/object_point_camera", 10)
-        self.pose_pub = self.create_publisher(PoseStamped, "/x5a_vision/object_pose", 10)
-        self.debug_pub = self.create_publisher(Image, "/x5a_vision/debug_image", 10)
-        self.stable_pub = self.create_publisher(Bool, "/x5a_vision/detection_stable", 10)
-        self.create_subscription(Image, self.color_topic, self.on_color, qos_profile_sensor_data)
-        self.create_subscription(Image, self.depth_topic, self.on_depth, qos_profile_sensor_data)
-        self.create_subscription(CameraInfo, self.info_topic, self.on_info, qos_profile_sensor_data)
+
+        self.pose_pubs = {
+            name: self.create_publisher(
+                PoseStamped, f"/x5a_vision/{name}_cube_pose", 10
+            )
+            for name in COLORS
+        }
+        self.stable_pubs = {
+            name: self.create_publisher(
+                Bool, f"/x5a_vision/{name}_cube_stable", 10
+            )
+            for name in COLORS
+        }
+        self.box_pose_pub = self.create_publisher(
+            PoseStamped, "/x5a_vision/box_pose", 10
+        )
+        self.box_stable_pub = self.create_publisher(
+            Bool, "/x5a_vision/box_stable", 10
+        )
+        # Backward-compatible aliases for the previously verified red-cube path.
+        self.point_pub = self.create_publisher(
+            PointStamped, "/x5a_vision/object_point_camera", 10
+        )
+        self.pose_pub = self.create_publisher(
+            PoseStamped, "/x5a_vision/object_pose", 10
+        )
+        self.stable_pub = self.create_publisher(
+            Bool, "/x5a_vision/detection_stable", 10
+        )
+        self.debug_pub = self.create_publisher(
+            Image, "/x5a_vision/debug_image", 10
+        )
+        self.create_subscription(
+            Image, self.color_topic, self.on_color, qos_profile_sensor_data
+        )
+        self.create_subscription(
+            Image, self.depth_topic, self.on_depth, qos_profile_sensor_data
+        )
+        self.create_subscription(
+            CameraInfo, self.info_topic, self.on_info, qos_profile_sensor_data
+        )
         self.get_logger().info(
-            f"RGB-D detector color={self.color_topic} depth={self.depth_topic} "
-            f"info={self.info_topic} {self.optical_frame}->{self.base_frame}"
+            f"multi-color RGB-D detector color={self.color_topic} "
+            f"depth={self.depth_topic} {self.optical_frame}->{self.base_frame}; "
+            "box=dark interior ray/table-plane intersection"
         )
 
     def _declare_parameters(self) -> None:
@@ -52,147 +98,493 @@ class CubeDetector(Node):
             "color_topic": "/camera/camera/color/image_raw",
             "aligned_depth_topic": "/camera/camera/aligned_depth_to_color/image_raw",
             "camera_info_topic": "/camera/camera/color/camera_info",
-            "optical_frame": "camera_color_optical_frame", "base_frame": "base_link",
-            "detection.hsv_lower": [0, 80, 40], "detection.hsv_upper": [12, 255, 255],
-            "detection.hsv_lower_2": [170, 80, 40], "detection.hsv_upper_2": [179, 255, 255],
-            "detection.min_area_px": 500.0, "detection.max_area_px": 5000.0,
-            "detection.open_iterations": 1, "detection.close_iterations": 2,
-            "detection.inner_erode_px": 5, "depth.scale_16uc1": 0.001,
-            "depth.min_m": 0.20, "depth.max_m": 0.80, "depth.near_percentile": 55.0,
-            "object.size_z": 0.03, "table.z": -0.006, "table.top_tolerance": 0.03,
-            "workspace.x_min": 0.06, "workspace.x_max": 0.44,
-            "workspace.y_min": 0.05, "workspace.y_max": 0.58,
-            "workspace.z_min": -0.015, "workspace.z_max": 0.08,
-            "workspace.expected_x": 0.20, "workspace.expected_y": 0.33,
-            "filter.window": 15, "filter.max_std_x": 0.005,
-            "filter.max_std_y": 0.005, "filter.max_std_z": 0.008,
+            "optical_frame": "camera_color_optical_frame",
+            "base_frame": "base_link",
+            "detection.min_area_px": 500.0,
+            "detection.max_area_px": 5000.0,
+            "detection.min_rectangularity": 0.50,
+            "detection.max_aspect_ratio": 1.8,
+            "detection.open_iterations": 1,
+            "detection.close_iterations": 2,
+            "detection.inner_erode_px": 5,
+            "depth.scale_16uc1": 0.001,
+            "depth.min_m": 0.20,
+            "depth.max_m": 0.80,
+            "depth.near_percentile": 55.0,
+            "object.size_z": 0.03,
+            "table.z": -0.006,
+            "table.top_tolerance": 0.03,
+            "workspace.x_min": 0.06,
+            "workspace.x_max": 0.44,
+            "workspace.y_min": 0.05,
+            "workspace.y_max": 0.58,
+            "workspace.z_min": -0.015,
+            "workspace.z_max": 0.08,
+            "workspace.expected_x": 0.20,
+            "workspace.expected_y": 0.33,
+            "filter.window": 15,
+            "filter.max_std_x": 0.005,
+            "filter.max_std_y": 0.005,
+            "filter.max_std_z": 0.008,
             "filter.reset_distance_m": 0.03,
+            "box.hsv_lower": [0, 0, 0],
+            "box.hsv_upper": [179, 255, 45],
+            "box.min_area_px": 12000.0,
+            "box.max_area_px": 60000.0,
+            "box.min_aspect_ratio": 1.15,
+            "box.max_aspect_ratio": 2.50,
+            "box.min_rectangularity": 0.80,
+            "box.border_margin_px": 5,
+            "box.open_iterations": 1,
+            "box.close_iterations": 2,
+            "box.filter_window": 15,
+            "box.max_std_xy": 0.010,
+            "box.reset_distance_m": 0.05,
+        }
+        color_defaults = {
+            "red": ([0, 80, 55], [7, 255, 255], True, [170, 80, 55], [179, 255, 255]),
+            "white": ([0, 0, 170], [179, 90, 255], False, [0, 0, 0], [0, 0, 0]),
+            "orange": ([8, 90, 70], [28, 255, 255], False, [0, 0, 0], [0, 0, 0]),
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
+        for name, (lower, upper, second, lower2, upper2) in color_defaults.items():
+            self.declare_parameter(f"colors.{name}.hsv_lower", lower)
+            self.declare_parameter(f"colors.{name}.hsv_upper", upper)
+            self.declare_parameter(f"colors.{name}.use_second_hsv", second)
+            self.declare_parameter(f"colors.{name}.hsv_lower_2", lower2)
+            self.declare_parameter(f"colors.{name}.hsv_upper_2", upper2)
 
     def _load_parameters(self) -> None:
         g = lambda name: self.get_parameter(name).value
-        self.color_topic = str(g("color_topic")); self.depth_topic = str(g("aligned_depth_topic"))
-        self.info_topic = str(g("camera_info_topic")); self.optical_frame = str(g("optical_frame"))
+        self.color_topic = str(g("color_topic"))
+        self.depth_topic = str(g("aligned_depth_topic"))
+        self.info_topic = str(g("camera_info_topic"))
+        self.optical_frame = str(g("optical_frame"))
         self.base_frame = str(g("base_frame"))
-        self.hsv1 = (np.array(g("detection.hsv_lower"), np.uint8), np.array(g("detection.hsv_upper"), np.uint8))
-        self.hsv2 = (np.array(g("detection.hsv_lower_2"), np.uint8), np.array(g("detection.hsv_upper_2"), np.uint8))
-        self.min_area = float(g("detection.min_area_px")); self.max_area = float(g("detection.max_area_px"))
-        self.open_iterations = int(g("detection.open_iterations")); self.close_iterations = int(g("detection.close_iterations"))
-        self.inner_erode_px = int(g("detection.inner_erode_px")); self.depth_scale_16u = float(g("depth.scale_16uc1"))
-        self.depth_min = float(g("depth.min_m")); self.depth_max = float(g("depth.max_m"))
-        self.near_percentile = float(g("depth.near_percentile")); self.object_height = float(g("object.size_z"))
-        self.table_z = float(g("table.z")); self.table_tol = float(g("table.top_tolerance"))
-        self.bounds = {k: float(g(f"workspace.{k}")) for k in ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max")}
-        self.expected_xy = np.array([float(g("workspace.expected_x")), float(g("workspace.expected_y"))])
+        self.color_ranges = {}
+        for name in COLORS:
+            self.color_ranges[name] = {
+                "lower": np.array(g(f"colors.{name}.hsv_lower"), np.uint8),
+                "upper": np.array(g(f"colors.{name}.hsv_upper"), np.uint8),
+                "second": bool(g(f"colors.{name}.use_second_hsv")),
+                "lower2": np.array(g(f"colors.{name}.hsv_lower_2"), np.uint8),
+                "upper2": np.array(g(f"colors.{name}.hsv_upper_2"), np.uint8),
+            }
+        self.min_area = float(g("detection.min_area_px"))
+        self.max_area = float(g("detection.max_area_px"))
+        self.min_rectangularity = float(g("detection.min_rectangularity"))
+        self.max_aspect = float(g("detection.max_aspect_ratio"))
+        self.open_iterations = int(g("detection.open_iterations"))
+        self.close_iterations = int(g("detection.close_iterations"))
+        self.inner_erode_px = int(g("detection.inner_erode_px"))
+        self.depth_scale_16u = float(g("depth.scale_16uc1"))
+        self.depth_min = float(g("depth.min_m"))
+        self.depth_max = float(g("depth.max_m"))
+        self.near_percentile = float(g("depth.near_percentile"))
+        self.object_height = float(g("object.size_z"))
+        self.table_z = float(g("table.z"))
+        self.table_tol = float(g("table.top_tolerance"))
+        self.bounds = {
+            key: float(g(f"workspace.{key}"))
+            for key in ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max")
+        }
+        self.expected_xy = np.array(
+            [float(g("workspace.expected_x")), float(g("workspace.expected_y"))]
+        )
         self.window = int(g("filter.window"))
-        self.max_std = np.array([float(g("filter.max_std_x")), float(g("filter.max_std_y")), float(g("filter.max_std_z"))])
+        self.max_std = np.array(
+            [
+                float(g("filter.max_std_x")),
+                float(g("filter.max_std_y")),
+                float(g("filter.max_std_z")),
+            ]
+        )
         self.reset_distance = float(g("filter.reset_distance_m"))
+        self.box_hsv = (
+            np.array(g("box.hsv_lower"), np.uint8),
+            np.array(g("box.hsv_upper"), np.uint8),
+        )
+        self.box_min_area = float(g("box.min_area_px"))
+        self.box_max_area = float(g("box.max_area_px"))
+        self.box_min_aspect = float(g("box.min_aspect_ratio"))
+        self.box_max_aspect = float(g("box.max_aspect_ratio"))
+        self.box_min_rectangularity = float(g("box.min_rectangularity"))
+        self.box_border_margin = int(g("box.border_margin_px"))
+        self.box_open_iterations = int(g("box.open_iterations"))
+        self.box_close_iterations = int(g("box.close_iterations"))
+        self.box_window = int(g("box.filter_window"))
+        self.box_max_std_xy = float(g("box.max_std_xy"))
+        self.box_reset_distance = float(g("box.reset_distance_m"))
 
     @staticmethod
     def stamp_sec(msg) -> float:
         return float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
 
     def on_color(self, msg: Image) -> None:
-        with self.lock: self.color_msg = msg
+        with self.lock:
+            self.color_msg = msg
 
     def on_info(self, msg: CameraInfo) -> None:
         self.info = msg
 
     def depth_meters(self, image: np.ndarray, encoding: str) -> np.ndarray:
         enc = encoding.upper()
-        if enc in ("16UC1", "MONO16"): scale = self.depth_scale_16u
-        elif enc == "32FC1": scale = 1.0
-        else: raise ValueError(f"unsupported depth encoding {encoding}")
+        if enc in ("16UC1", "MONO16"):
+            scale = self.depth_scale_16u
+        elif enc == "32FC1":
+            scale = 1.0
+        else:
+            raise ValueError(f"unsupported depth encoding {encoding}")
         if not self.depth_encoding_logged:
             self.get_logger().info(f"depth encoding={encoding} scale_to_m={scale}")
             self.depth_encoding_logged = True
         return np.asarray(image, dtype=np.float32) * scale
 
-    def contour_measurement(self, contour, depth: np.ndarray, camera_info: CameraInfo, stamp) -> Optional[Dict]:
+    def clean_mask(self, mask: np.ndarray, open_count: int, close_count: int) -> np.ndarray:
+        kernel = np.ones((3, 3), np.uint8)
+        if open_count:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=open_count)
+        if close_count:
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=close_count)
+        return mask
+
+    def mask_for_color(self, hsv: np.ndarray, name: str) -> np.ndarray:
+        spec = self.color_ranges[name]
+        mask = cv2.inRange(hsv, spec["lower"], spec["upper"])
+        if spec["second"]:
+            mask |= cv2.inRange(hsv, spec["lower2"], spec["upper2"])
+        return self.clean_mask(mask, self.open_iterations, self.close_iterations)
+
+    def lookup_transform(self, stamp):
+        return self.tf_buffer.lookup_transform(
+            self.base_frame,
+            self.optical_frame,
+            Time.from_msg(stamp),
+            timeout=Duration(seconds=0.2),
+        )
+
+    def contour_measurement(
+        self, contour, depth: np.ndarray, camera_info: CameraInfo, stamp
+    ) -> Optional[Dict]:
         area = float(cv2.contourArea(contour))
-        if area < self.min_area or area > self.max_area: return None
+        if area < self.min_area or area > self.max_area:
+            return None
+        rect = cv2.minAreaRect(contour)
+        rw, rh = rect[1]
+        if min(rw, rh) <= 1.0:
+            return None
+        aspect = max(rw, rh) / min(rw, rh)
+        rectangularity = area / (rw * rh)
+        if aspect > self.max_aspect or rectangularity < self.min_rectangularity:
+            return None
         moments = cv2.moments(contour)
-        if abs(moments["m00"]) < 1e-9: return None
-        u = float(moments["m10"] / moments["m00"]); v = float(moments["m01"] / moments["m00"])
+        if abs(moments["m00"]) < 1e-9:
+            return None
+        u = float(moments["m10"] / moments["m00"])
+        v = float(moments["m01"] / moments["m00"])
         h, w = depth.shape[:2]
-        if not (1 <= u < w - 1 and 1 <= v < h - 1): return None
-        mask = np.zeros((h, w), np.uint8); cv2.drawContours(mask, [contour], -1, 255, -1)
+        if not (1 <= u < w - 1 and 1 <= v < h - 1):
+            return None
+        mask = np.zeros((h, w), np.uint8)
+        cv2.drawContours(mask, [contour], -1, 255, -1)
         k = max(1, self.inner_erode_px | 1)
         inner = cv2.erode(mask, np.ones((k, k), np.uint8), iterations=1) > 0
         values = depth[inner]
-        values = values[np.isfinite(values) & (values >= self.depth_min) & (values <= self.depth_max)]
-        if values.size < 20: return None
+        values = values[
+            np.isfinite(values)
+            & (values >= self.depth_min)
+            & (values <= self.depth_max)
+        ]
+        if values.size < 20:
+            return None
         values = values[values <= float(np.percentile(values, self.near_percentile))]
-        if values.size < 10: return None
+        if values.size < 10:
+            return None
         z = float(np.median(values))
-        fx, fy, cx, cy = float(camera_info.k[0]), float(camera_info.k[4]), float(camera_info.k[2]), float(camera_info.k[5])
-        if fx <= 0.0 or fy <= 0.0: return None
-        point_camera = PointStamped(); point_camera.header.stamp = stamp; point_camera.header.frame_id = self.optical_frame
-        point_camera.point.x = (u - cx) * z / fx; point_camera.point.y = (v - cy) * z / fy; point_camera.point.z = z
+        fx, fy = float(camera_info.k[0]), float(camera_info.k[4])
+        cx, cy = float(camera_info.k[2]), float(camera_info.k[5])
+        if fx <= 0.0 or fy <= 0.0:
+            return None
+        point_camera = PointStamped()
+        point_camera.header.stamp = stamp
+        point_camera.header.frame_id = self.optical_frame
+        point_camera.point.x = (u - cx) * z / fx
+        point_camera.point.y = (v - cy) * z / fy
+        point_camera.point.z = z
         try:
-            transform = self.tf_buffer.lookup_transform(self.base_frame, self.optical_frame, Time.from_msg(stamp), timeout=Duration(seconds=0.2))
-            point_base = do_transform_point(point_camera, transform)
+            point_base = do_transform_point(point_camera, self.lookup_transform(stamp))
         except TransformException as exc:
-            self.get_logger().warn(f"TF unavailable: {exc}", throttle_duration_sec=2.0); return None
-        p = np.array([point_base.point.x, point_base.point.y, point_base.point.z], dtype=float); b = self.bounds
-        if not (b["x_min"] <= p[0] <= b["x_max"] and b["y_min"] <= p[1] <= b["y_max"] and b["z_min"] <= p[2] <= b["z_max"]): return None
-        if abs(p[2] - (self.table_z + self.object_height)) > self.table_tol: return None
+            self.get_logger().warn(
+                f"TF unavailable: {exc}", throttle_duration_sec=2.0
+            )
+            return None
+        p = np.array(
+            [point_base.point.x, point_base.point.y, point_base.point.z], dtype=float
+        )
+        b = self.bounds
+        if not (
+            b["x_min"] <= p[0] <= b["x_max"]
+            and b["y_min"] <= p[1] <= b["y_max"]
+            and b["z_min"] <= p[2] <= b["z_max"]
+        ):
+            return None
+        if abs(p[2] - (self.table_z + self.object_height)) > self.table_tol:
+            return None
         x, y, wb, hb = cv2.boundingRect(contour)
-        return {"area": area, "pixel": (u, v), "depth": z, "camera": point_camera,
-                "base": p, "bbox": (x, y, wb, hb), "contour": contour,
-                "score": float(np.linalg.norm(p[:2] - self.expected_xy))}
+        return {
+            "area": area,
+            "pixel": (u, v),
+            "depth": z,
+            "camera": point_camera,
+            "base": p,
+            "bbox": (x, y, wb, hb),
+            "contour": contour,
+            "score": float(np.linalg.norm(p[:2] - self.expected_xy)),
+        }
+
+    def ray_table_intersection(
+        self, u: float, v: float, camera_info: CameraInfo, stamp
+    ) -> Optional[np.ndarray]:
+        fx, fy = float(camera_info.k[0]), float(camera_info.k[4])
+        cx, cy = float(camera_info.k[2]), float(camera_info.k[5])
+        if fx <= 0.0 or fy <= 0.0:
+            return None
+        origin = PointStamped()
+        origin.header.stamp = stamp
+        origin.header.frame_id = self.optical_frame
+        ray = PointStamped()
+        ray.header = origin.header
+        ray.point.x = (u - cx) / fx
+        ray.point.y = (v - cy) / fy
+        ray.point.z = 1.0
+        try:
+            transform = self.lookup_transform(stamp)
+            origin_base = do_transform_point(origin, transform)
+            ray_base = do_transform_point(ray, transform)
+        except TransformException as exc:
+            self.get_logger().warn(
+                f"box TF unavailable: {exc}", throttle_duration_sec=2.0
+            )
+            return None
+        o = np.array(
+            [origin_base.point.x, origin_base.point.y, origin_base.point.z], dtype=float
+        )
+        r = np.array(
+            [ray_base.point.x, ray_base.point.y, ray_base.point.z], dtype=float
+        )
+        direction = r - o
+        if abs(direction[2]) < 1e-9:
+            return None
+        scale = (self.table_z - o[2]) / direction[2]
+        if scale <= 0.0:
+            return None
+        p = o + scale * direction
+        b = self.bounds
+        if not (
+            b["x_min"] <= p[0] <= b["x_max"]
+            and b["y_min"] <= p[1] <= b["y_max"]
+        ):
+            return None
+        p[2] = self.table_z
+        return p
+
+    def box_measurement(
+        self, contour, camera_info: CameraInfo, stamp, image_shape
+    ) -> Optional[Dict]:
+        area = float(cv2.contourArea(contour))
+        if area < self.box_min_area or area > self.box_max_area:
+            return None
+        (u, v), (rw, rh), angle = cv2.minAreaRect(contour)
+        if min(rw, rh) <= 1.0:
+            return None
+        aspect = max(rw, rh) / min(rw, rh)
+        rectangularity = area / (rw * rh)
+        if not (
+            self.box_min_aspect <= aspect <= self.box_max_aspect
+            and rectangularity >= self.box_min_rectangularity
+        ):
+            return None
+        corners = cv2.boxPoints(((u, v), (rw, rh), angle))
+        # The black sponge is intentionally used as a simple drop target.  Its
+        # centre remains usable when the large sponge contour touches an image
+        # edge, so do not reject an otherwise valid candidate solely for that.
+        base = self.ray_table_intersection(float(u), float(v), camera_info, stamp)
+        if base is None:
+            return None
+        return {
+            "pixel": (float(u), float(v)),
+            "base": base,
+            "contour": contour,
+            "corners": corners,
+            "area": area,
+            "aspect": aspect,
+            "rectangularity": rectangularity,
+        }
+
+    @staticmethod
+    def update_history(history, point: np.ndarray, reset_distance: float):
+        if history:
+            center = np.median(np.asarray(history), axis=0)
+            if float(np.linalg.norm(point - center)) > reset_distance:
+                history.clear()
+        history.append(point)
+        values = np.asarray(history)
+        return np.median(values, axis=0), np.std(values, axis=0)
+
+    def publish_pose(self, publisher, stamp, xyz: np.ndarray) -> PoseStamped:
+        pose = PoseStamped()
+        pose.header.stamp = stamp
+        pose.header.frame_id = self.base_frame
+        pose.pose.position.x = float(xyz[0])
+        pose.pose.position.y = float(xyz[1])
+        pose.pose.position.z = float(xyz[2])
+        pose.pose.orientation.w = 1.0
+        publisher.publish(pose)
+        return pose
 
     def on_depth(self, msg: Image) -> None:
-        with self.lock: color_msg = self.color_msg
+        with self.lock:
+            color_msg = self.color_msg
         info = self.info
-        if color_msg is None or info is None or abs(self.stamp_sec(color_msg) - self.stamp_sec(msg)) > 0.10: return
+        if (
+            color_msg is None
+            or info is None
+            or abs(self.stamp_sec(color_msg) - self.stamp_sec(msg)) > 0.10
+        ):
+            return
         try:
             bgr = self.bridge.imgmsg_to_cv2(color_msg, "bgr8")
-            depth = self.depth_meters(self.bridge.imgmsg_to_cv2(msg, "passthrough"), msg.encoding)
+            depth = self.depth_meters(
+                self.bridge.imgmsg_to_cv2(msg, "passthrough"), msg.encoding
+            )
         except Exception as exc:
-            self.get_logger().error(f"image conversion failed: {exc}"); return
+            self.get_logger().error(f"image conversion failed: {exc}")
+            return
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.hsv1[0], self.hsv1[1]) | cv2.inRange(hsv, self.hsv2[0], self.hsv2[1])
-        kernel = np.ones((3, 3), np.uint8)
-        if self.open_iterations: mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=self.open_iterations)
-        if self.close_iterations: mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=self.close_iterations)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        candidates = [m for m in (self.contour_measurement(c, depth, info, msg.header.stamp) for c in contours) if m is not None]
         debug = bgr.copy()
-        if not candidates:
-            self.history.clear(); self.stable_pub.publish(Bool(data=False))
-            cv2.putText(debug, "NO VALID CUBE", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(debug, encoding="bgr8")); return
-        best = min(candidates, key=lambda item: item["score"]); p = best["base"]
-        if self.history and float(np.linalg.norm(p - np.median(np.asarray(self.history), axis=0))) > self.reset_distance: self.history.clear()
-        self.history.append(p); values = np.asarray(self.history); median = np.median(values, axis=0); std = np.std(values, axis=0)
-        stable = len(self.history) >= self.window and bool(np.all(std <= self.max_std))
-        self.point_pub.publish(best["camera"])
-        pose = PoseStamped(); pose.header.stamp = msg.header.stamp; pose.header.frame_id = self.base_frame
-        pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = [float(v) for v in median]; pose.pose.orientation.w = 1.0
-        self.pose_pub.publish(pose); self.stable_pub.publish(Bool(data=stable))
-        cv2.drawContours(debug, [best["contour"]], -1, (0, 255, 0), 2); u, v = best["pixel"]
-        cv2.circle(debug, (round(u), round(v)), 5, (255, 0, 0), -1); x, y, wb, hb = best["bbox"]
-        cv2.rectangle(debug, (x, y), (x + wb, y + hb), (0, 255, 255), 1)
-        cv2.putText(debug, f"pixel=({u:.1f},{v:.1f}) depth={best['depth']:.3f}m", (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2)
-        cv2.putText(debug, f"base=({median[0]:.3f},{median[1]:.3f},{median[2]:.3f}) stable={stable}", (12, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2)
+        status_parts = []
+
+        for name in COLORS:
+            mask = self.mask_for_color(hsv, name)
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            candidates = [
+                result
+                for result in (
+                    self.contour_measurement(c, depth, info, msg.header.stamp)
+                    for c in contours
+                )
+                if result is not None
+            ]
+            if not candidates:
+                self.histories[name].clear()
+                self.stable_pubs[name].publish(Bool(data=False))
+                if name == "red":
+                    self.stable_pub.publish(Bool(data=False))
+                status_parts.append(f"{name}=NO")
+                continue
+            best = min(candidates, key=lambda item: item["score"])
+            median, std = self.update_history(
+                self.histories[name], best["base"], self.reset_distance
+            )
+            stable = len(self.histories[name]) >= self.window and bool(
+                np.all(std <= self.max_std)
+            )
+            pose = self.publish_pose(
+                self.pose_pubs[name], msg.header.stamp, median
+            )
+            self.stable_pubs[name].publish(Bool(data=stable))
+            if name == "red":
+                self.pose_pub.publish(pose)
+                self.point_pub.publish(best["camera"])
+                self.stable_pub.publish(Bool(data=stable))
+            color = DRAW_COLORS[name]
+            cv2.drawContours(debug, [best["contour"]], -1, color, 2)
+            u, v = best["pixel"]
+            cv2.circle(debug, (round(u), round(v)), 5, color, -1)
+            cv2.putText(
+                debug,
+                f"{name.upper()} {'STABLE' if stable else 'TRACKING'}",
+                (round(u) + 8, round(v) - 8),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                color,
+                2,
+            )
+            status_parts.append(
+                f"{name}=({median[0]:.3f},{median[1]:.3f},{median[2]:.3f})/{stable}"
+            )
+
+        box_mask = cv2.inRange(hsv, self.box_hsv[0], self.box_hsv[1])
+        box_mask = self.clean_mask(
+            box_mask, self.box_open_iterations, self.box_close_iterations
+        )
+        box_contours, _ = cv2.findContours(
+            box_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        box_candidates = [
+            result
+            for result in (
+                self.box_measurement(c, info, msg.header.stamp, bgr.shape)
+                for c in box_contours
+            )
+            if result is not None
+        ]
+        if box_candidates:
+            best_box = max(box_candidates, key=lambda item: item["area"])
+            median, std = self.update_history(
+                self.box_history, best_box["base"][:2], self.box_reset_distance
+            )
+            stable = len(self.box_history) >= self.box_window and bool(
+                np.all(std <= self.box_max_std_xy)
+            )
+            # Only box-center XY is used. Z is the known table plane and is not
+            # interpreted as box height or reflective depth.
+            box_xyz = np.array([median[0], median[1], self.table_z], dtype=float)
+            self.publish_pose(self.box_pose_pub, msg.header.stamp, box_xyz)
+            self.box_stable_pub.publish(Bool(data=stable))
+            corners = np.int32(np.round(best_box["corners"]))
+            cv2.polylines(debug, [corners], True, (255, 255, 0), 2)
+            u, v = best_box["pixel"]
+            cv2.circle(debug, (round(u), round(v)), 6, (255, 255, 0), -1)
+            cv2.putText(
+                debug,
+                f"BOX CENTER {'STABLE' if stable else 'TRACKING'}",
+                (round(u) - 70, round(v)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (255, 255, 0),
+                2,
+            )
+            status_parts.append(
+                f"box=({median[0]:.3f},{median[1]:.3f})/{stable}"
+            )
+        else:
+            self.box_history.clear()
+            self.box_stable_pub.publish(Bool(data=False))
+            status_parts.append("box=NO")
+
         self.debug_pub.publish(self.bridge.cv2_to_imgmsg(debug, encoding="bgr8"))
         now_ns = self.get_clock().now().nanoseconds
         if now_ns - self.last_log_ns > 1_000_000_000:
             self.last_log_ns = now_ns
-            pc = best["camera"].point
-            self.get_logger().info(
-                f"VISION DETECTION pixel=({u:.1f},{v:.1f}) depth={best['depth']:.4f} "
-                f"camera=({pc.x:.4f},{pc.y:.4f},{pc.z:.4f}) "
-                f"base=({median[0]:.4f},{median[1]:.4f},{median[2]:.4f}) "
-                f"std_mm={np.round(std*1000,2).tolist()} stable={stable} n={len(self.history)}")
+            self.get_logger().info("MULTI DETECTION " + " ".join(status_parts))
 
 
 def main(args=None) -> None:
-    rclpy.init(args=args); node = CubeDetector()
-    try: rclpy.spin(node)
-    finally: node.destroy_node(); rclpy.shutdown()
+    rclpy.init(args=args)
+    node = CubeDetector()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()

@@ -10,18 +10,32 @@ CAMERA_TIMEOUT="${CAMERA_TIMEOUT:-20}"
 VISION_TIMEOUT="${VISION_TIMEOUT:-20}"
 OBJECT_TIMEOUT="${OBJECT_TIMEOUT:-60}"
 TF_TIMEOUT="${TF_TIMEOUT:-10}"
+CAN_RX_MIN_PACKETS="${CAN_RX_MIN_PACKETS:-50}"
 
 MODE="real"
-case "${1:-}" in
-  "") ;;
-  --dry-run) MODE="dry-run" ;;
-  --vision-only) MODE="vision-only" ;;
+TARGET_COLOR="red"
+while (( $# > 0 )); do
+  case "$1" in
+  --dry-run)
+    MODE="dry-run"
+    ;;
+  --vision-only)
+    MODE="vision-only"
+    ;;
+  --color)
+    shift
+    [[ $# -gt 0 ]] || { echo "--color requires red, white, or orange" >&2; exit 2; }
+    TARGET_COLOR="${1,,}"
+    ;;
   --help|-h)
     cat <<'EOF'
 Usage:
 
 ./run_x5a_vision_pick.sh
-    Run one automatic visual pick-and-place
+    Pick the red cube and place it in the detected box
+
+./run_x5a_vision_pick.sh --color red|white|orange
+    Pick the selected cube and place it in the detected box
 
 ./run_x5a_vision_pick.sh --dry-run
     Detect and plan only
@@ -36,7 +50,22 @@ EOF
     echo "Run $0 --help for usage." >&2
     exit 2
     ;;
+  esac
+  shift
+done
+
+case "${TARGET_COLOR}" in
+  red|white|orange) ;;
+  *)
+    echo "Invalid color: ${TARGET_COLOR}; expected red, white, or orange." >&2
+    exit 2
+    ;;
 esac
+
+SELECTED_POSE_TOPIC="/x5a_vision/${TARGET_COLOR}_cube_pose"
+SELECTED_STABLE_TOPIC="/x5a_vision/${TARGET_COLOR}_cube_stable"
+BOX_POSE_TOPIC="/x5a_vision/box_pose"
+BOX_STABLE_TOPIC="/x5a_vision/box_stable"
 
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 RUN_DIR="${WS_DIR}/logs/run_${RUN_STAMP}"
@@ -52,6 +81,7 @@ ROBOT_PID=""
 MOVEIT_PID=""
 VISION_PID=""
 TASK_PID=""
+RECOVERY_ATTEMPTED=0
 
 stop_owned_process() {
   local label="$1"
@@ -61,7 +91,7 @@ stop_owned_process() {
   echo "Stopping ${label} (PID ${pid})..."
   kill -INT "${pid}" 2>/dev/null || true
   local i
-  for i in {1..30}; do
+  for i in {1..80}; do
     kill -0 "${pid}" 2>/dev/null || break
     sleep 0.1
   done
@@ -69,6 +99,86 @@ stop_owned_process() {
     kill -TERM "${pid}" 2>/dev/null || true
   fi
   wait "${pid}" 2>/dev/null || true
+}
+
+find_robot_launch_pid() {
+  pgrep -f '^/usr/bin/python3 /opt/ros/humble/bin/ros2 launch arx_x5_controller open_single_arm.launch.py([[:space:]]|$)' | head -n 1
+}
+
+find_moveit_launch_pid() {
+  pgrep -f '^/usr/bin/python3 /opt/ros/humble/bin/ros2 launch x5a_moveit_config x5a_real_moveit.launch.py([[:space:]]|$)' | head -n 1
+}
+
+can_is_up() {
+  ip -o link show can1 2>/dev/null | grep -q '<[^>]*UP[,>]'
+}
+
+can_rx_packets() {
+  [[ -r /sys/class/net/can1/statistics/rx_packets ]] || return 1
+  tr -d '[:space:]' </sys/class/net/can1/statistics/rx_packets
+}
+
+can_rx_healthy() {
+  local before after
+  before="$(can_rx_packets)" || return 1
+  sleep 1
+  after="$(can_rx_packets)" || return 1
+  [[ "${before}" =~ ^[0-9]+$ && "${after}" =~ ^[0-9]+$ ]] || return 1
+  printf 'CAN RX delta: %d packets/s\n' "$((after - before))" >>"${ROBOT_LOG}"
+  (( after - before >= CAN_RX_MIN_PACKETS ))
+}
+
+stop_existing_robot_stack() {
+  local pid
+  pid="$(find_moveit_launch_pid || true)"
+  if [[ -n "${pid}" ]]; then
+    echo "Stopping stale MoveIt launch (PID ${pid})..."
+    stop_owned_process "stale MoveIt" "${pid}"
+  fi
+  MOVEIT_PID=""
+
+  pid="$(find_robot_launch_pid || true)"
+  if [[ -n "${pid}" ]]; then
+    echo "Stopping stale X5Controller launch (PID ${pid})..."
+    stop_owned_process "stale X5Controller" "${pid}"
+  fi
+  ROBOT_PID=""
+
+  sleep 1
+  if pgrep -x X5Controller >/dev/null 2>&1 || \
+     pgrep -f '/official_trajectory_adapter([[:space:]]|$)' >/dev/null 2>&1 || \
+     pgrep -x move_group >/dev/null 2>&1; then
+    fail "X5A_RECOVERY" "Stale robot processes did not stop cleanly."
+  fi
+}
+
+start_robot_controller() {
+  start_background ROBOT_PID "${ROBOT_LOG}" \
+    ros2 launch arx_x5_controller open_single_arm.launch.py
+}
+
+controlled_robot_recovery() {
+  local reason="$1"
+  if (( RECOVERY_ATTEMPTED != 0 )); then
+    fail "X5A_RECOVERY" "Robot communication is still offline after one controlled restart: ${reason}"
+  fi
+  RECOVERY_ATTEMPTED=1
+  echo "X5A communication offline: ${reason}"
+  echo "Recovering CAN, X5Controller and MoveIt once..."
+  echo "RECOVERY: ${reason}" >>"${ROBOT_LOG}"
+
+  stop_existing_robot_stack
+  RESET_CAN=true "${WS_DIR}/scripts/setup_can_x5a.sh" >>"${ROBOT_LOG}" 2>&1 || \
+    fail "CAN_RECOVERY" "Failed to recreate can1; see robot.log."
+  can_is_up || fail "CAN_RECOVERY" "can1 is not UP after recovery."
+
+  start_robot_controller
+  wait_until "${ROBOT_TIMEOUT}" topic_message_once /arm_status \
+    "${RUN_DIR}/arm_status_recovered.yaml" || \
+    fail "X5A_RECOVERY" "No /arm_status after restarting X5Controller."
+  wait_until "${ROBOT_TIMEOUT}" can_rx_healthy || \
+    fail "X5A_RECOVERY" "CAN RX did not resume; motors 1-6 are still offline."
+  echo "X5A communication recovered." >>"${ROBOT_LOG}"
 }
 
 cleanup() {
@@ -251,30 +361,39 @@ echo "========================================"
 echo " ARX X5A AUTO VISION PICK"
 echo "========================================"
 echo "mode: ${MODE}"
+echo "target_color: ${TARGET_COLOR}"
 echo "logs: ${RUN_DIR}"
 echo
 
 if [[ "${MODE}" != "vision-only" ]]; then
-  if ! ip -o link show can1 2>/dev/null | grep -q '<[^>]*UP[,>]'; then
+  if ! can_is_up; then
     [[ -x "${WS_DIR}/scripts/setup_can_x5a.sh" ]] || \
       fail "CAN" "scripts/setup_can_x5a.sh not found or not executable."
-    "${WS_DIR}/scripts/setup_can_x5a.sh" >>"${ROBOT_LOG}" 2>&1 || \
-      fail "CAN" "CAN initialization failed; see robot.log."
+    if pgrep -x slcand >/dev/null 2>&1 || \
+       pgrep -x X5Controller >/dev/null 2>&1 || \
+       node_exists /move_group; then
+      controlled_robot_recovery "can1 is missing or DOWN while an old robot stack is still running"
+    else
+      "${WS_DIR}/scripts/setup_can_x5a.sh" >>"${ROBOT_LOG}" 2>&1 || \
+        fail "CAN" "CAN initialization failed; see robot.log."
+    fi
   fi
-  ip -o link show can1 2>/dev/null | grep -q '<[^>]*UP[,>]' || \
+  can_is_up || \
     fail "CAN" "can1 is not UP."
   echo "[1/6] CAN              PASS"
 
   if node_exists /arm && pgrep -x X5Controller >/dev/null 2>&1; then
     echo "Existing X5Controller detected; reusing it." >>"${ROBOT_LOG}"
   elif ! node_exists /arm && ! pgrep -x X5Controller >/dev/null 2>&1; then
-    start_background ROBOT_PID "${ROBOT_LOG}" \
-      ros2 launch arx_x5_controller open_single_arm.launch.py
+    start_robot_controller
   else
     fail "X5A" "Partial/stale X5Controller detected; clean restart required."
   fi
   wait_until "${ROBOT_TIMEOUT}" topic_message_once /arm_status "${RUN_DIR}/arm_status.yaml" || \
     fail "X5A" "No real /arm_status message within ${ROBOT_TIMEOUT} s."
+  if ! wait_until 5 can_rx_healthy; then
+    controlled_robot_recovery "can1 has no live motor feedback"
+  fi
   echo "[2/6] X5A              PASS"
 
   MOVE_PRESENT=0
@@ -352,11 +471,16 @@ else
   echo "[5/6] Eye-to-Hand TF   PASS"
 fi
 
-wait_until "${VISION_TIMEOUT}" topic_exists /x5a_vision/detection_stable || \
-  fail "VISION" "detection_stable topic is unavailable."
-wait_until "${VISION_TIMEOUT}" topic_message_once /x5a_vision/detection_stable \
-  "${RUN_DIR}/detection_stable.yaml" || \
-  fail "VISION" "No detection_stable message received."
+wait_until "${VISION_TIMEOUT}" topic_exists "${SELECTED_STABLE_TOPIC}" || \
+  fail "VISION" "${SELECTED_STABLE_TOPIC} is unavailable."
+wait_until "${VISION_TIMEOUT}" topic_exists "${BOX_STABLE_TOPIC}" || \
+  fail "VISION" "${BOX_STABLE_TOPIC} is unavailable."
+wait_until "${VISION_TIMEOUT}" topic_message_once "${SELECTED_STABLE_TOPIC}" \
+  "${RUN_DIR}/selected_stable.yaml" || \
+  fail "VISION" "No selected-cube stable message received."
+wait_until "${VISION_TIMEOUT}" topic_message_once "${BOX_STABLE_TOPIC}" \
+  "${RUN_DIR}/box_stable.yaml" || \
+  fail "VISION" "No box stable message received."
 if [[ "${MODE}" == "vision-only" ]]; then
   echo "[3/3] Vision           PASS"
 else
@@ -367,13 +491,16 @@ wait_for_valid_object() {
   local deadline=$((SECONDS + OBJECT_TIMEOUT))
   local stable_file="${RUN_DIR}/stable_current.yaml"
   local pose_file="${RUN_DIR}/object_pose.yaml"
-  local point_file="${RUN_DIR}/object_point_camera.yaml"
+  local box_stable_file="${RUN_DIR}/box_stable_current.yaml"
+  local box_pose_file="${RUN_DIR}/box_pose.yaml"
   while (( SECONDS < deadline )); do
-    if topic_message_once /x5a_vision/detection_stable "${stable_file}" && \
+    if topic_message_once "${SELECTED_STABLE_TOPIC}" "${stable_file}" && \
        grep -Eq '^data: true$' "${stable_file}" && \
-       topic_message_once /x5a_vision/object_pose "${pose_file}" && \
-       topic_message_once /x5a_vision/object_point_camera "${point_file}"; then
-      if /usr/bin/python3 - "${VISION_CONFIG}" "${pose_file}" "${point_file}" \
+       topic_message_once "${SELECTED_POSE_TOPIC}" "${pose_file}" && \
+       topic_message_once "${BOX_STABLE_TOPIC}" "${box_stable_file}" && \
+       grep -Eq '^data: true$' "${box_stable_file}" && \
+       topic_message_once "${BOX_POSE_TOPIC}" "${box_pose_file}"; then
+      if /usr/bin/python3 - "${VISION_CONFIG}" "${pose_file}" "${box_pose_file}" \
           >"${RUN_DIR}/object_xyz.txt" <<'PY'
 import math, sys, time, yaml
 
@@ -386,29 +513,31 @@ def first_doc(path):
 cfg = first_doc(sys.argv[1])
 params = next(iter(cfg.values()))["ros__parameters"]
 pose = first_doc(sys.argv[2])
-point = first_doc(sys.argv[3])
+box = first_doc(sys.argv[3])
 
-if pose.get("header", {}).get("frame_id") != params.get("base_frame", "base_link"):
+base = params.get("base_frame", "base_link")
+if pose.get("header", {}).get("frame_id") != base or box.get("header", {}).get("frame_id") != base:
     raise SystemExit(2)
 p = pose["pose"]["position"]
 x, y, z = (float(p[k]) for k in ("x", "y", "z"))
-depth = float(point["point"]["z"])
-if not all(math.isfinite(v) for v in (x, y, z, depth)):
+b = box["pose"]["position"]
+bx, by, bz = (float(b[k]) for k in ("x", "y", "z"))
+if not all(math.isfinite(v) for v in (x, y, z, bx, by, bz)):
     raise SystemExit(3)
 w = params["workspace"]
 if not (w["x_min"] <= x <= w["x_max"] and
         w["y_min"] <= y <= w["y_max"] and
-        w["z_min"] <= z <= w["z_max"]):
+        w["z_min"] <= z <= w["z_max"] and
+        w["x_min"] <= bx <= w["x_max"] and
+        w["y_min"] <= by <= w["y_max"]):
     raise SystemExit(4)
-d = params["depth"]
-if not (d["min_m"] <= depth <= d["max_m"]):
-    raise SystemExit(5)
-stamp = pose.get("header", {}).get("stamp", {})
-t = float(stamp.get("sec", 0)) + float(stamp.get("nanosec", 0)) * 1e-9
-age = time.time() - t
-if t <= 0 or age < -1.0 or age > 3.0:
-    raise SystemExit(6)
-print(f"{x:.9f} {y:.9f} {z:.9f} {depth:.9f}")
+for message in (pose, box):
+    stamp = message.get("header", {}).get("stamp", {})
+    t = float(stamp.get("sec", 0)) + float(stamp.get("nanosec", 0)) * 1e-9
+    age = time.time() - t
+    if t <= 0 or age < -1.0 or age > 3.0:
+        raise SystemExit(6)
+print(f"{x:.9f} {y:.9f} {z:.9f} {bx:.9f} {by:.9f} {bz:.9f}")
 PY
       then
         return 0
@@ -426,20 +555,23 @@ echo "Camera: READY"
 echo "Hand-eye TF: READY"
 echo "Vision: READY"
 echo
-echo "Waiting for cube..."
+echo "Waiting for ${TARGET_COLOR} cube and movable box..."
 
 wait_for_valid_object || \
   fail "OBJECT_DETECTION" "No stable object detected within ${OBJECT_TIMEOUT} s."
-read -r OBJ_X OBJ_Y OBJ_Z OBJ_DEPTH <"${RUN_DIR}/object_xyz.txt"
+read -r OBJ_X OBJ_Y OBJ_Z BOX_X BOX_Y BOX_Z <"${RUN_DIR}/object_xyz.txt"
 
 echo
 echo "OBJECT DETECTED"
+echo "color: ${TARGET_COLOR}"
 echo
 echo "base_link:"
 echo "x: ${OBJ_X}"
 echo "y: ${OBJ_Y}"
 echo "z: ${OBJ_Z}"
-echo "depth: ${OBJ_DEPTH}"
+echo "box_x: ${BOX_X}"
+echo "box_y: ${BOX_Y}"
+echo "box_plane_z: ${BOX_Z}"
 
 if [[ "${MODE}" == "vision-only" ]]; then
   echo
@@ -454,7 +586,7 @@ echo
 echo "Planning..."
 start_background TASK_PID "${PICK_LOG}" \
   ros2 launch x5a_pick_place pick_place.launch.py \
-    plan_only:="${PLAN_ONLY}" vision_enabled:=true
+    plan_only:="${PLAN_ONLY}" vision_enabled:=true target_color:="${TARGET_COLOR}"
 
 set +e
 wait "${TASK_PID}"
@@ -512,4 +644,3 @@ echo "PICK AND PLACE COMPLETE"
 echo "========================================"
 echo " VISION PICK AND PLACE: PASS"
 echo "========================================"
-

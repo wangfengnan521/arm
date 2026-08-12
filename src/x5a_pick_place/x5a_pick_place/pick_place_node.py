@@ -103,9 +103,20 @@ class PickPlaceNode(Node):
         self.create_subscription(
             Bool, self.vision_stable_topic, self._vision_stable_cb, 10, callback_group=self.cb
         )
+        self.create_subscription(
+            PoseStamped, self.box_pose_topic, self._box_pose_cb, 10,
+            callback_group=self.cb
+        )
+        self.create_subscription(
+            Bool, self.box_stable_topic, self._box_stable_cb, 10,
+            callback_group=self.cb
+        )
         self.vision_pose: Optional[PoseStamped] = None
         self.vision_pose_arrival = 0.0
         self.vision_stable = False
+        self.box_pose: Optional[PoseStamped] = None
+        self.box_pose_arrival = 0.0
+        self.box_stable = False
 
         self.move_ac = ActionClient(self, MoveGroup, "move_action", callback_group=self.cb)
         self.execute_ac = ActionClient(
@@ -133,7 +144,7 @@ class PickPlaceNode(Node):
         self.get_logger().info(
             f"pick_place ready plan_only={self.plan_only} vision={self.vision_enabled} "
             f"execution={self.execute_action} gripper={self.gripper_action} "
-            f"state={self.joint_state_topic}"
+            f"state={self.joint_state_topic} target_color={self.target_color}"
         )
 
     def _declare_params(self) -> None:
@@ -153,10 +164,11 @@ class PickPlaceNode(Node):
         self.declare_parameter("execution.timeout", 120.0)
         self.declare_parameter("state.joint_state_topic", "/joint_states")
         self.declare_parameter("vision.enabled", False)
-        self.declare_parameter("vision.pose_topic", "/x5a_vision/object_pose")
-        self.declare_parameter("vision.stable_topic", "/x5a_vision/detection_stable")
+        self.declare_parameter("target_color", "red")
         self.declare_parameter("vision.max_pose_age", 0.5)
         self.declare_parameter("vision.wait_timeout", 10.0)
+        self.declare_parameter("box.pose_topic", "/x5a_vision/box_pose")
+        self.declare_parameter("box.stable_topic", "/x5a_vision/box_stable")
         self.declare_parameter("grasp_orientation_rpy", [3.14159265, 0.0, 0.0])
         self.declare_parameter("transit_orientation_rpy", [0.0, 1.15, 0.0])
         for ns, keys in {
@@ -218,10 +230,17 @@ class PickPlaceNode(Node):
         self.execution_timeout = float(g("execution.timeout").value)
         self.joint_state_topic = str(g("state.joint_state_topic").value)
         self.vision_enabled = bool(g("vision.enabled").value)
-        self.vision_pose_topic = str(g("vision.pose_topic").value)
-        self.vision_stable_topic = str(g("vision.stable_topic").value)
+        self.target_color = str(g("target_color").value).strip().lower()
+        if self.target_color not in ("red", "white", "orange"):
+            raise ValueError(
+                f"target_color must be red, white, or orange; got {self.target_color!r}"
+            )
+        self.vision_pose_topic = f"/x5a_vision/{self.target_color}_cube_pose"
+        self.vision_stable_topic = f"/x5a_vision/{self.target_color}_cube_stable"
         self.vision_max_age = float(g("vision.max_pose_age").value)
         self.vision_wait_timeout = float(g("vision.wait_timeout").value)
+        self.box_pose_topic = str(g("box.pose_topic").value)
+        self.box_stable_topic = str(g("box.stable_topic").value)
         self.grasp_rpy = [float(x) for x in g("grasp_orientation_rpy").value]
         self.transit_rpy = [float(x) for x in g("transit_orientation_rpy").value]
         self.obj_x = float(g("object.x").value)
@@ -277,6 +296,15 @@ class PickPlaceNode(Node):
 
     def _vision_stable_cb(self, msg: Bool) -> None:
         self.vision_stable = bool(msg.data)
+
+    def _box_pose_cb(self, msg: PoseStamped) -> None:
+        if msg.header.frame_id != self.base_frame:
+            return
+        self.box_pose = msg
+        self.box_pose_arrival = time.monotonic()
+
+    def _box_stable_cb(self, msg: Bool) -> None:
+        self.box_stable = bool(msg.data)
 
     def wait_ready(self, timeout: float = 30.0) -> bool:
         t0 = time.time()
@@ -764,7 +792,17 @@ class PickPlaceNode(Node):
         ok, frac = self.cartesian_to(pose, stage + "_CART")
         if ok:
             return True, frac
-        self.get_logger().warn(f"{stage}: cartesian fraction={frac:.3f}, fallback to IK joint plan")
+        self.get_logger().warn(
+            f"{stage}: cartesian fraction={frac:.3f}, fallback to MoveIt pose planning"
+        )
+        if self.move_pose(
+            pose,
+            stage + "_POSE",
+            fallback_velocity_scaling,
+            fallback_acceleration_scaling,
+        ):
+            return True, 1.0
+        self.get_logger().warn(f"{stage}: pose planning failed, fallback to IK joint plan")
         joints = self.ik_joints_for_pose(pose)
         if joints is None:
             self.log_stage(stage, planning="FAIL", reason="IK failed", target_tcp=pose_to_xyz(pose))
@@ -785,23 +823,54 @@ class PickPlaceNode(Node):
     def make_transit_pose(self, x: float, y: float, z: float) -> Pose:
         return pose_xyz_quat(x, y, z, self.transit_quat)
 
-    def wait_for_frozen_vision(self) -> Optional[Tuple[float, float, float]]:
-        """Wait for a fresh stable base_link pose, then freeze it for this cycle."""
+    def wait_for_frozen_vision(
+        self,
+    ) -> Optional[
+        Tuple[Tuple[float, float, float], Tuple[float, float, float]]
+    ]:
+        """Freeze the selected cube and movable-box poses together."""
         deadline = time.monotonic() + self.vision_wait_timeout
-        self.log_stage("WAIT_FOR_VISION", timeout=self.vision_wait_timeout)
+        self.log_stage(
+            "WAIT_FOR_VISION",
+            target_color=self.target_color,
+            timeout=self.vision_wait_timeout,
+        )
         while time.monotonic() < deadline:
-            pose = self.vision_pose
-            age = time.monotonic() - self.vision_pose_arrival
-            if pose is not None and self.vision_stable and age <= self.vision_max_age:
-                xyz = pose_to_xyz(pose.pose)
-                if all(math.isfinite(v) for v in xyz):
-                    self.log_stage("STABLE_DETECTION", age=age, xyz=xyz)
-                    self.log_stage("FREEZE_OBJECT_POSE", xyz=xyz)
-                    return xyz
+            now = time.monotonic()
+            cube_age = now - self.vision_pose_arrival
+            box_age = now - self.box_pose_arrival
+            if (
+                self.vision_pose is not None
+                and self.box_pose is not None
+                and self.vision_stable
+                and self.box_stable
+                and cube_age <= self.vision_max_age
+                and box_age <= self.vision_max_age
+            ):
+                cube_xyz = pose_to_xyz(self.vision_pose.pose)
+                box_xyz = pose_to_xyz(self.box_pose.pose)
+                if all(math.isfinite(v) for v in cube_xyz + box_xyz):
+                    self.log_stage(
+                        "STABLE_DETECTION",
+                        target_color=self.target_color,
+                        cube_age=cube_age,
+                        box_age=box_age,
+                        cube_xyz=cube_xyz,
+                        box_xyz=box_xyz,
+                    )
+                    self.log_stage(
+                        "FREEZE_POSES",
+                        target_color=self.target_color,
+                        cube_xyz=cube_xyz,
+                        box_xyz=box_xyz,
+                    )
+                    return cube_xyz, box_xyz
             time.sleep(0.05)
         self.log_stage(
-            "WAIT_FOR_VISION", result="FAIL", stable=self.vision_stable,
-            pose_age=time.monotonic() - self.vision_pose_arrival,
+            "WAIT_FOR_VISION", result="FAIL", target_color=self.target_color,
+            cube_stable=self.vision_stable, box_stable=self.box_stable,
+            cube_age=time.monotonic() - self.vision_pose_arrival,
+            box_age=time.monotonic() - self.box_pose_arrival,
         )
         return None
 
@@ -814,9 +883,10 @@ class PickPlaceNode(Node):
             frozen = self.wait_for_frozen_vision()
             if frozen is None:
                 return 1
-            top_x, top_y, top_z = frozen
+            (top_x, top_y, top_z), (box_x, box_y, _) = frozen
         else:
             top_x, top_y, top_z = self.obj_x, self.obj_y, self.obj_z + self.obj_sz * 0.5
+            box_x, box_y = self.place_x, self.place_y
 
         # RGB-D reports the visible top surface. PlanningScene needs the cube center,
         # while the TCP grasp target uses the independently calibrated grasp offsets.
@@ -826,7 +896,10 @@ class PickPlaceNode(Node):
         grasp_x = top_x + self.gx
         grasp_y = top_y + self.gy
         grasp_z = top_z + self.gz
-        place_x, place_y, place_z = self.place_x, self.place_y, self.place_z
+        place_x, place_y = box_x, box_y
+        # Movable box contributes center XY only. Keep the previously verified
+        # fixed release height so the gripper remains above the box interior.
+        place_z = self.place_z
         self.setup_scene()
 
         pre_grasp = self.make_transit_pose(
@@ -836,11 +909,16 @@ class PickPlaceNode(Node):
         pre_place = self.make_transit_pose(
             place_x, place_y, place_z + self.pre_place_h
         )
-        place = self.make_pose(place_x, place_y, place_z)
+        # Keep one orientation throughout PRE_PLACE -> DESCEND.  Switching
+        # from the transit pitch to the grasp pitch during a nominally vertical
+        # descent can drive joint4 into its limit and truncate the Cartesian
+        # path even when the box position itself is reachable.
+        place = self.make_transit_pose(place_x, place_y, place_z)
         self.log_stage(
             "POSES", visual_top=(top_x, top_y, top_z),
             collision_center=(self.scene_obj_x, self.scene_obj_y, self.scene_obj_z),
-            pre_grasp=pose_to_xyz(pre_grasp), grasp=pose_to_xyz(grasp), place=pose_to_xyz(place),
+            pre_grasp=pose_to_xyz(pre_grasp), grasp=pose_to_xyz(grasp),
+            box_center_xy=(box_x, box_y), release=pose_to_xyz(place),
         )
 
         if not self.call_gripper(True):
@@ -923,6 +1001,8 @@ class PickPlaceNode(Node):
             descend_fraction=frac_desc,
             retreat_fraction=frac_ret,
             plan_only=self.plan_only,
+            target_color=self.target_color if self.vision_enabled else "fixed",
+            frozen_box_xy=(box_x, box_y),
         )
         if self.plan_only and self.vision_enabled:
             self.get_logger().info("VISION PICK AND PLACE PLAN: PASS")

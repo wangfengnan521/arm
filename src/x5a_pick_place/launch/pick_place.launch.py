@@ -12,6 +12,7 @@ def generate_launch_description():
         DeclareLaunchArgument('config', default_value=cfg),
         DeclareLaunchArgument('plan_only', default_value='false'),
         DeclareLaunchArgument('vision_enabled', default_value='false'),
+        DeclareLaunchArgument('target_color', default_value='red'),
         Node(
             package='x5a_pick_place',
             executable='pick_place_node',
@@ -22,6 +23,7 @@ def generate_launch_description():
                 {
                     'plan_only': ParameterValue(LaunchConfiguration('plan_only'), value_type=bool),
                     'vision.enabled': ParameterValue(LaunchConfiguration('vision_enabled'), value_type=bool),
+                    'target_color': LaunchConfiguration('target_color'),
                 },
             ],
         ),

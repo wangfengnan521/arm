@@ -42,3 +42,4 @@ frames.pdf
 # Calibration runtime output (the verified input set is explicitly retained)
 src/x5a_handeye/data/*
 !src/x5a_handeye/data/manual_samples_readonly.json
+!src/x5a_handeye/data/manual_samples_recalib_20260812.json

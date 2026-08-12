@@ -24,10 +24,12 @@
       joint_state_topic: /joint_states
     vision:
       enabled: false
-      pose_topic: /x5a_vision/object_pose
-      stable_topic: /x5a_vision/detection_stable
       max_pose_age: 0.5
       wait_timeout: 10.0
+    target_color: red
+    box:
+      pose_topic: /x5a_vision/box_pose
+      stable_topic: /x5a_vision/box_stable
     object:
       x: 0.18
       y: -0.08
@@ -38,7 +40,8 @@
     place:
       x: 0.28
       y: 0.16
-      z: 0.094
+      # Fixed safe release height; movable-box vision supplies center XY only.
+      z: 0.144
     table:
       x: 0.22
       y: 0.00
