@@ -141,8 +141,12 @@ class PickPlaceNode(Node):
         self.declare_parameter("planning.group", "arm")
         self.declare_parameter("planning.base_frame", "base_link")
         self.declare_parameter("planning.tcp_frame", "tool0")
-        self.declare_parameter("planning.velocity_scaling", 0.12)
-        self.declare_parameter("planning.acceleration_scaling", 0.12)
+        self.declare_parameter("planning.transit_velocity_scaling", 0.45)
+        self.declare_parameter("planning.transit_acceleration_scaling", 0.18)
+        self.declare_parameter("planning.precision_velocity_scaling", 0.15)
+        self.declare_parameter("planning.precision_acceleration_scaling", 0.08)
+        self.declare_parameter("planning.lift_retreat_velocity_scaling", 0.20)
+        self.declare_parameter("planning.lift_retreat_acceleration_scaling", 0.10)
         self.declare_parameter("planning.planning_time", 5.0)
         self.declare_parameter("planning.max_attempts", 8)
         self.declare_parameter("execution.action_name", "/execute_trajectory")
@@ -198,8 +202,16 @@ class PickPlaceNode(Node):
         self.group = str(g("planning.group").value)
         self.base_frame = str(g("planning.base_frame").value)
         self.tcp_frame = str(g("planning.tcp_frame").value)
-        self.vel = float(g("planning.velocity_scaling").value)
-        self.acc = float(g("planning.acceleration_scaling").value)
+        self.transit_vel = float(g("planning.transit_velocity_scaling").value)
+        self.transit_acc = float(g("planning.transit_acceleration_scaling").value)
+        self.precision_vel = float(g("planning.precision_velocity_scaling").value)
+        self.precision_acc = float(g("planning.precision_acceleration_scaling").value)
+        self.lift_retreat_vel = float(
+            g("planning.lift_retreat_velocity_scaling").value
+        )
+        self.lift_retreat_acc = float(
+            g("planning.lift_retreat_acceleration_scaling").value
+        )
         self.planning_time = float(g("planning.planning_time").value)
         self.max_attempts = int(g("planning.max_attempts").value)
         self.execute_action = str(g("execution.action_name").value)
@@ -462,15 +474,21 @@ class PickPlaceNode(Node):
         time.sleep(0.2)
         self.log_stage("DETACH_OBJECT", result="PASS", place=list(place_xyz))
 
-    def move_joints(self, joints: Sequence[float], stage: str) -> bool:
+    def move_joints(
+        self,
+        joints: Sequence[float],
+        stage: str,
+        velocity_scaling: float,
+        acceleration_scaling: float,
+    ) -> bool:
         assert self.q is not None
         g = MoveGroup.Goal()
         req = MotionPlanRequest()
         req.group_name = self.group
         req.num_planning_attempts = self.max_attempts
         req.allowed_planning_time = self.planning_time
-        req.max_velocity_scaling_factor = self.vel
-        req.max_acceleration_scaling_factor = self.acc
+        req.max_velocity_scaling_factor = velocity_scaling
+        req.max_acceleration_scaling_factor = acceleration_scaling
         rs = RobotState()
         rs.joint_state.name = list(ARM_JOINTS)
         rs.joint_state.position = self.planning_start_joints()
@@ -520,22 +538,32 @@ class PickPlaceNode(Node):
             execution="SKIP" if self.plan_only else ("PASS" if ok else "FAIL"),
             start_tcp=start_tcp,
             actual_tcp=actual,
+            velocity_scaling=velocity_scaling,
+            acceleration_scaling=acceleration_scaling,
         )
         return ok
 
-    def move_pose(self, pose: Pose, stage: str) -> bool:
+    def move_pose(
+        self,
+        pose: Pose,
+        stage: str,
+        velocity_scaling: float,
+        acceleration_scaling: float,
+    ) -> bool:
         assert self.q is not None
         # IK pre-solve for free-space pose goals, then joint-space plan (more reliable on this arm).
         joints = self.ik_joints_for_pose(pose)
         if joints is not None:
-            return self.move_joints(joints, stage)
+            return self.move_joints(
+                joints, stage, velocity_scaling, acceleration_scaling
+            )
         g = MoveGroup.Goal()
         req = MotionPlanRequest()
         req.group_name = self.group
         req.num_planning_attempts = self.max_attempts
         req.allowed_planning_time = self.planning_time
-        req.max_velocity_scaling_factor = self.vel
-        req.max_acceleration_scaling_factor = self.acc
+        req.max_velocity_scaling_factor = velocity_scaling
+        req.max_acceleration_scaling_factor = acceleration_scaling
         rs = RobotState()
         rs.joint_state.name = list(ARM_JOINTS)
         rs.joint_state.position = self.planning_start_joints()
@@ -594,6 +622,8 @@ class PickPlaceNode(Node):
             target_tcp=target,
             start_tcp=start_tcp,
             actual_tcp=actual,
+            velocity_scaling=velocity_scaling,
+            acceleration_scaling=acceleration_scaling,
         )
         return ok
 
@@ -723,7 +753,13 @@ class PickPlaceNode(Node):
         except Exception:
             return None
 
-    def vertical_move(self, pose: Pose, stage: str) -> Tuple[bool, float]:
+    def vertical_move(
+        self,
+        pose: Pose,
+        stage: str,
+        fallback_velocity_scaling: float,
+        fallback_acceleration_scaling: float,
+    ) -> Tuple[bool, float]:
         """Prefer cartesian; fallback to IK+joint planning for vertical stages."""
         ok, frac = self.cartesian_to(pose, stage + "_CART")
         if ok:
@@ -733,7 +769,12 @@ class PickPlaceNode(Node):
         if joints is None:
             self.log_stage(stage, planning="FAIL", reason="IK failed", target_tcp=pose_to_xyz(pose))
             return False, frac
-        ok2 = self.move_joints(joints, stage + "_IK")
+        ok2 = self.move_joints(
+            joints,
+            stage + "_IK",
+            fallback_velocity_scaling,
+            fallback_acceleration_scaling,
+        )
         if ok2:
             return True, 1.0
         return False, frac
@@ -804,7 +845,12 @@ class PickPlaceNode(Node):
 
         if not self.call_gripper(True):
             return 1
-        if not self.move_pose(pre_grasp, "MOVE_PRE_GRASP"):
+        if not self.move_pose(
+            pre_grasp,
+            "MOVE_PRE_GRASP",
+            self.transit_vel,
+            self.transit_acc,
+        ):
             return 1
         # The visual object was used for scene construction. Remove it immediately
         # before contact so the gripper is allowed to enter the grasp volume.
@@ -813,7 +859,9 @@ class PickPlaceNode(Node):
             [self.obj_sx, self.obj_sy, self.obj_sz], operation=CollisionObject.REMOVE,
         )
         time.sleep(0.15)
-        ok, frac_app = self.vertical_move(grasp, "APPROACH")
+        ok, frac_app = self.vertical_move(
+            grasp, "APPROACH", self.precision_vel, self.precision_acc
+        )
         if not ok:
             return 1
         if not self.call_gripper(False):
@@ -828,12 +876,21 @@ class PickPlaceNode(Node):
         lift = self.make_transit_pose(
             lift_start[0], lift_start[1], lift_start[2] + self.lift_h
         )
-        ok, frac_lift = self.vertical_move(lift, "LIFT")
+        ok, frac_lift = self.vertical_move(
+            lift, "LIFT", self.lift_retreat_vel, self.lift_retreat_acc
+        )
         if not ok:
             return 1
-        if not self.move_pose(pre_place, "MOVE_PRE_PLACE"):
+        if not self.move_pose(
+            pre_place,
+            "MOVE_PRE_PLACE",
+            self.transit_vel,
+            self.transit_acc,
+        ):
             return 1
-        ok, frac_desc = self.vertical_move(place, "DESCEND")
+        ok, frac_desc = self.vertical_move(
+            place, "DESCEND", self.precision_vel, self.precision_acc
+        )
         if not ok:
             return 1
         if not self.call_gripper(True):
@@ -846,10 +903,17 @@ class PickPlaceNode(Node):
         retreat = self.make_transit_pose(
             retreat_start[0], retreat_start[1], retreat_start[2] + self.retreat_h
         )
-        ok, frac_ret = self.vertical_move(retreat, "RETREAT")
+        ok, frac_ret = self.vertical_move(
+            retreat, "RETREAT", self.lift_retreat_vel, self.lift_retreat_acc
+        )
         if not ok:
             return 1
-        if not self.move_joints(self.ready_joints, "RETURN_HOME"):
+        if not self.move_joints(
+            self.ready_joints,
+            "RETURN_HOME",
+            self.transit_vel,
+            self.transit_acc,
+        ):
             self.log_stage("RETURN_HOME", result="WARN_CONTINUE")
 
         self.log_stage(

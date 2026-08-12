@@ -5,8 +5,12 @@
       group: arm
       base_frame: base_link
       tcp_frame: tool0
-      velocity_scaling: 0.08
-      acceleration_scaling: 0.08
+      transit_velocity_scaling: 0.45
+      transit_acceleration_scaling: 0.18
+      precision_velocity_scaling: 0.15
+      precision_acceleration_scaling: 0.08
+      lift_retreat_velocity_scaling: 0.20
+      lift_retreat_acceleration_scaling: 0.10
       planning_time: 5.0
       max_attempts: 8
     # Keep contact poses vertical. High transit poses use a smaller pitch so
