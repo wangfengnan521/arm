@@ -229,4 +229,3 @@ VISION CLOSED LOOP VERIFIED
 - 当前不是完整的 `ros2_control` `HardwareInterface`。
 - 相机 serial number 在 `x5a_vision/launch/vision.launch.py` 中按本机 D435i 配置；更换相机时需更新或参数化。
 - 真机操作必须由熟悉机械臂、CAN 和急停流程的人员现场监护。
-
