@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MoveIt SRDF for ARX X5A pure planning.
+  NOT VALIDATED FOR HARDWARE. Do not Execute on real robot.
+-->
+<robot name="X5A">
+  <group name="arm">
+    <chain base_link="base_link" tip_link="tool0"/>
+  </group>
+  <group name="gripper">
+    <joint name="joint7"/>
+    <joint name="joint8"/>
+  </group>
+
+  <group_state name="demo_home" group="arm">
+    <!-- SIMULATION ONLY. Not a certified X5A hardware home. -->
+    <joint name="joint1" value="0"/>
+    <joint name="joint2" value="0"/>
+    <joint name="joint3" value="0"/>
+    <joint name="joint4" value="0"/>
+    <joint name="joint5" value="0"/>
+    <joint name="joint6" value="0"/>
+  </group_state>
+  <group_state name="demo_ready" group="arm">
+    <!-- SIMULATION ONLY. Values taken from ARX ROS2 v2_collect.yaml go_home_position style pose; not X5A-hardware validated. -->
+    <joint name="joint1" value="0.0"/>
+    <joint name="joint2" value="0.8"/>
+    <joint name="joint3" value="0.8"/>
+    <joint name="joint4" value="-0.5"/>
+    <joint name="joint5" value="0.0"/>
+    <joint name="joint6" value="0.0"/>
+  </group_state>
+  <group_state name="open" group="gripper">
+    <joint name="joint7" value="0.03"/>
+    <joint name="joint8" value="0.03"/>
+  </group_state>
+  <group_state name="closed" group="gripper">
+    <joint name="joint7" value="0.0"/>
+    <joint name="joint8" value="0.0"/>
+  </group_state>
+
+  <end_effector name="x5a_gripper" parent_link="tool0" group="gripper" parent_group="arm"/>
+
+  <virtual_joint name="world_joint" type="fixed" parent_frame="world" child_link="base_link"/>
+
+  <!-- Adjacent / always-touching pairs (manual). Additional never-colliding pairs generated next. -->
+  <disable_collisions link1="base_link" link2="link1" reason="Adjacent"/>
+  <disable_collisions link1="link1" link2="link2" reason="Adjacent"/>
+  <disable_collisions link1="link2" link2="link3" reason="Adjacent"/>
+  <disable_collisions link1="link3" link2="link4" reason="Adjacent"/>
+  <disable_collisions link1="link4" link2="link5" reason="Adjacent"/>
+  <disable_collisions link1="link5" link2="link6" reason="Adjacent"/>
+  <disable_collisions link1="link6" link2="link7" reason="Adjacent"/>
+  <disable_collisions link1="link6" link2="link8" reason="Adjacent"/>
+  <disable_collisions link1="link6" link2="tool0" reason="Adjacent"/>
+  <disable_collisions link1="link7" link2="tool0" reason="Never"/>
+  <disable_collisions link1="link8" link2="tool0" reason="Never"/>
+  <disable_collisions link1="link7" link2="link8" reason="Default"/>
+  <disable_collisions link1="link5" link2="link7" reason="Never"/>
+  <disable_collisions link1="link5" link2="link8" reason="Never"/>
+  <disable_collisions link1="link4" link2="link6" reason="Never"/>
+  <disable_collisions link1="link3" link2="link5" reason="Never"/>
+  <disable_collisions link1="base_link" link2="link2" reason="Never"/>
+  <disable_collisions link1="link1" link2="link3" reason="Never"/>
+  <disable_collisions link1="link2" link2="link4" reason="Never"/>
+  <disable_collisions link1="link3" link2="link6" reason="Never"/>
+  <disable_collisions link1="link4" link2="link7" reason="Never"/>
+  <disable_collisions link1="link4" link2="link8" reason="Never"/>
+  <disable_collisions link1="link4" link2="tool0" reason="Never"/>
+  <disable_collisions link1="link5" link2="tool0" reason="Never"/>
+  <disable_collisions link1="link1" link2="tool0" reason="Never"/>
+  <disable_collisions link1="link2" link2="tool0" reason="Never"/>
+  <disable_collisions link1="link3" link2="tool0" reason="Never"/>
+  <disable_collisions link1="base_link" link2="tool0" reason="Never"/>
+  <disable_collisions link1="base_link" link2="link7" reason="Never"/>
+  <disable_collisions link1="base_link" link2="link8" reason="Never"/>
+  <disable_collisions link1="link1" link2="link7" reason="Never"/>
+  <disable_collisions link1="link1" link2="link8" reason="Never"/>
+  <disable_collisions link1="link2" link2="link7" reason="Never"/>
+  <disable_collisions link1="link2" link2="link8" reason="Never"/>
+  <disable_collisions link1="link3" link2="link7" reason="Never"/>
+  <disable_collisions link1="link3" link2="link8" reason="Never"/>
+</robot>

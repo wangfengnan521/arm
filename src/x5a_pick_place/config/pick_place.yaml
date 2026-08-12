@@ -1,0 +1,63 @@
+/**:
+  ros__parameters:
+    plan_only: false
+    planning:
+      group: arm
+      base_frame: base_link
+      tcp_frame: tool0
+      velocity_scaling: 0.08
+      acceleration_scaling: 0.08
+      planning_time: 5.0
+      max_attempts: 8
+    # Keep contact poses vertical. High transit poses use a smaller pitch so
+    # X5A joint4 stays inside its measured reachable range.
+    grasp_orientation_rpy: [0.0, 1.45, 0.0]
+    transit_orientation_rpy: [0.0, 1.15, 0.0]
+    execution:
+      action_name: /execute_trajectory
+      timeout: 120.0
+    state:
+      joint_state_topic: /joint_states
+    vision:
+      enabled: false
+      pose_topic: /x5a_vision/object_pose
+      stable_topic: /x5a_vision/detection_stable
+      max_pose_age: 0.5
+      wait_timeout: 10.0
+    object:
+      x: 0.18
+      y: -0.08
+      z: 0.10
+      size_x: 0.03
+      size_y: 0.03
+      size_z: 0.03
+    place:
+      x: 0.28
+      y: 0.16
+      z: 0.094
+    table:
+      x: 0.22
+      y: 0.00
+      z: -0.026
+      size_x: 0.70
+      size_y: 0.80
+      size_z: 0.04
+    motion:
+      pre_grasp_height: 0.08
+      lift_height: 0.08
+      pre_place_height: 0.08
+      retreat_height: 0.08
+      cartesian_step: 0.01
+      jump_threshold: 0.0
+      min_cartesian_fraction: 0.95
+    grasp:
+      x_offset: 0.0
+      y_offset: 0.0
+      z_offset: 0.040
+    gripper:
+      action_name: /x5a_gripper_controller/gripper_cmd
+      open_position_m: 0.044
+      close_position_m: 0.0
+      max_effort: 0.0
+      timeout: 3.0
+    ready_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

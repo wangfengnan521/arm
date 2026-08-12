@@ -1,0 +1,23 @@
+board:
+  type: charuco
+  dictionary: DICT_4X4_50
+  squares_x: 5
+  squares_y: 7
+  square_length_m: 0.020
+  marker_length_m: 0.014
+  width_m: 0.100
+  height_m: 0.140
+  marker_border_bits: 1
+  expected_marker_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+
+print:
+  png_dpi: 508
+  png_pixels_per_mm: 20
+  pdf_page: A4
+  print_scale_percent: 100
+  disable_fit_to_page: true
+  check_line_mm: 100
+
+frames:
+  pose_output: camera_color_optical_frame
+  convention: "T_camera_board; x right, y down, z forward"

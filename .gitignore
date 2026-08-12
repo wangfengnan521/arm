@@ -1,0 +1,44 @@
+# ROS 2
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# C/C++
+*.o
+*.so
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary and runtime output
+*.tmp
+*.swp
+*~
+*.log
+*.pid
+
+# ROS bags
+rosbag2_*/
+*.db3
+*.mcap
+
+# Core dumps
+core
+core.*
+
+# Generated TF/debug files
+*.gv
+frames.pdf
+
+# Calibration runtime output (the verified input set is explicitly retained)
+src/x5a_handeye/data/*
+!src/x5a_handeye/data/manual_samples_readonly.json
+

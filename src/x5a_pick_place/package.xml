@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>x5a_pick_place</name>
+  <version>0.1.0</version>
+  <description>Pose-driven visual pick and place for ARX X5A with MoveIt 2 planning and official ARX command/status topics.</description>
+  <maintainer email="user@example.com">x5a user</maintainer>
+  <license>BSD</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>shape_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>moveit_msgs</depend>
+  <depend>x5a_handeye</depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
