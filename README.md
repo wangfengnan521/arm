@@ -1,5 +1,28 @@
 # ARX X5A ROS 2 视觉抓取放置系统
 
+## 一键视觉抓取
+
+机械臂、RealSense、CANable2 正确连接后：
+
+```bash
+cd <workspace>
+./run_x5a_vision_pick.sh
+```
+
+仅视觉测试：
+
+```bash
+./run_x5a_vision_pick.sh --vision-only
+```
+
+只规划不执行：
+
+```bash
+./run_x5a_vision_pick.sh --dry-run
+```
+
+脚本会自动 source ROS/厂商/项目环境，复用健康的既有节点，并依次检查 CAN、真实关节反馈、MoveIt actions、RealSense 消息、Eye-to-Hand TF 和稳定视觉坐标。默认只执行一次，放置并回 Home 后退出。详细日志保存在 `logs/run_YYYYMMDD_HHMMSS/`。
+
 ## 项目简介
 
 这是一个在真实 ARX X5A 上完成验证的 ROS 2 Humble 项目，使用 MoveIt 2、Intel RealSense RGB-D 和 Eye-to-Hand 手眼标定，实现视觉定位、抓取、固定位置放置及回 Home。
@@ -120,7 +143,7 @@ source install/setup.bash
 
 ```bash
 cd ~/arx/arm
-./scripts/setup_can1.sh
+./scripts/setup_can_x5a.sh
 ```
 
 脚本不会保存 sudo 密码，并会拒绝为同一接口启动第二个 `slcand`。启动后应看到 `can1` 为 `UP`、`ERROR-ACTIVE`。不要运行多个 `slcand` 或看门狗循环。
