@@ -457,6 +457,8 @@ class PickPlaceNode(Node):
         aco = AttachedCollisionObject()
         aco.link_name = self.tcp_frame
         aco.object.id = "object"
+        aco.object.header.frame_id = self.tcp_frame
+        aco.object.header.stamp = self.get_clock().now().to_msg()
         aco.object.operation = CollisionObject.ADD
         # object pose relative to tool0 approx identity; use current world pose as attached
         prim = SolidPrimitive()
@@ -486,6 +488,8 @@ class PickPlaceNode(Node):
         # detach and place as world object
         aco = AttachedCollisionObject()
         aco.object.id = "object"
+        aco.object.header.frame_id = self.tcp_frame
+        aco.object.header.stamp = self.get_clock().now().to_msg()
         aco.object.operation = CollisionObject.REMOVE
         scene = PlanningScene()
         scene.is_diff = True
@@ -582,9 +586,17 @@ class PickPlaceNode(Node):
         # IK pre-solve for free-space pose goals, then joint-space plan (more reliable on this arm).
         joints = self.ik_joints_for_pose(pose)
         if joints is not None:
-            return self.move_joints(
-                joints, stage, velocity_scaling, acceleration_scaling
-            )
+            if self.move_joints(
+                joints, stage + "_IK", velocity_scaling, acceleration_scaling
+            ):
+                return True
+        else:
+            self.log_stage(stage + "_IK", planning="FAIL", reason="IK pre-solve failed")
+        self.last_joints = list(self.q)
+        self.get_logger().warn(
+            f"{stage}: retry with Pose Goal from current joint state {self.last_joints}"
+        )
+        pose_stage = stage + "_POSE"
         g = MoveGroup.Goal()
         req = MotionPlanRequest()
         req.group_name = self.group
@@ -625,15 +637,15 @@ class PickPlaceNode(Node):
         start_tcp = self.current_tcp()
         fut = self.move_ac.send_goal_async(g)
         if not self.wait_future(fut, 20.0):
-            self.log_stage(stage, planning="FAIL", reason="goal timeout", target_tcp=target)
+            self.log_stage(pose_stage, planning="FAIL", reason="goal timeout", target_tcp=target)
             return False
         gh = fut.result()
         if not gh or not gh.accepted:
-            self.log_stage(stage, planning="FAIL", target_tcp=target, reason="not accepted")
+            self.log_stage(pose_stage, planning="FAIL", target_tcp=target, reason="not accepted")
             return False
         rf = gh.get_result_async()
         if not self.wait_future(rf, 120.0):
-            self.log_stage(stage, planning="FAIL", reason="result timeout", target_tcp=target)
+            self.log_stage(pose_stage, planning="FAIL", reason="result timeout", target_tcp=target)
             return False
         res = rf.result().result
         planning_ok = res.error_code.val == 1
@@ -641,10 +653,10 @@ class PickPlaceNode(Node):
         if planning_ok:
             self._update_last_joints_from_result(res)
             if not self.plan_only:
-                ok = self.execute_moveit_trajectory(res.planned_trajectory, stage + "_EXEC")
+                ok = self.execute_moveit_trajectory(res.planned_trajectory, pose_stage + "_EXEC")
         actual = self.current_tcp()
         self.log_stage(
-            stage,
+            pose_stage,
             planning="PASS" if planning_ok else f"FAIL({res.error_code.val})",
             execution="SKIP" if self.plan_only else ("PASS" if ok else "FAIL"),
             target_tcp=target,
