@@ -289,30 +289,17 @@ class CubeDetector(Node):
         rectangularity = area / (rw * rh)
         if aspect > self.max_aspect or rectangularity < self.min_rectangularity:
             return None
-        moments = cv2.moments(contour)
-        if abs(moments["m00"]) < 1e-9:
-            return None
-        u = float(moments["m10"] / moments["m00"])
-        v = float(moments["m01"] / moments["m00"])
         h, w = depth.shape[:2]
-        if not (1 <= u < w - 1 and 1 <= v < h - 1):
-            return None
         mask = np.zeros((h, w), np.uint8)
         cv2.drawContours(mask, [contour], -1, 255, -1)
         k = max(1, self.inner_erode_px | 1)
         inner = cv2.erode(mask, np.ones((k, k), np.uint8), iterations=1) > 0
-        values = depth[inner]
-        values = values[
-            np.isfinite(values)
-            & (values >= self.depth_min)
-            & (values <= self.depth_max)
-        ]
-        if values.size < 20:
+        top = self.select_top_face(inner, depth)
+        if top is None:
             return None
-        values = values[values <= float(np.percentile(values, self.near_percentile))]
-        if values.size < 10:
+        u, v, z = top
+        if not (1 <= u < w - 1 and 1 <= v < h - 1):
             return None
-        z = float(np.median(values))
         fx, fy = float(camera_info.k[0]), float(camera_info.k[4])
         cx, cy = float(camera_info.k[2]), float(camera_info.k[5])
         if fx <= 0.0 or fy <= 0.0:
@@ -334,17 +321,20 @@ class CubeDetector(Node):
             [point_base.point.x, point_base.point.y, point_base.point.z], dtype=float
         )
         b = self.bounds
-        if not (
+        in_workspace = (
             b["x_min"] <= p[0] <= b["x_max"]
             and b["y_min"] <= p[1] <= b["y_max"]
             and b["z_min"] <= p[2] <= b["z_max"]
             and float(np.hypot(p[0], p[1])) <= b["r_max"]
-        ):
-            return None
-        if abs(p[2] - (self.table_z + self.object_height)) > self.table_tol:
-            return None
+        )
+        on_table = abs(p[2] - (self.table_z + self.object_height)) <= self.table_tol
         x, y, wb, hb = cv2.boundingRect(contour)
         yaw = self.cube_yaw_base(rect, z, camera_info, stamp)
+        reject = None
+        if not in_workspace:
+            reject = "WS"
+        elif not on_table:
+            reject = "Z"
         return {
             "area": area,
             "pixel": (u, v),
@@ -355,8 +345,41 @@ class CubeDetector(Node):
             "contour": contour,
             "rect": rect,
             "yaw": yaw,
+            "reject": reject,
             "score": float(np.linalg.norm(p[:2] - self.expected_xy)),
         }
+
+    def select_top_face(
+        self, inner: np.ndarray, depth: np.ndarray
+    ) -> Optional[Tuple[float, float, float]]:
+        """Return (u, v, z) of the cube top face, not the camera-facing side.
+
+        A slanted view makes red/orange sides light up. Those side pixels are
+        nearer than the top. If the depth span is large, keep the farther
+        cluster (top). If the blob is almost flat, keep the nearer cluster
+        (top-down view, same as the old white-cube path).
+        """
+        ys, xs = np.nonzero(inner)
+        if xs.size < 20:
+            return None
+        zvals = depth[ys, xs]
+        good = (
+            np.isfinite(zvals)
+            & (zvals >= self.depth_min)
+            & (zvals <= self.depth_max)
+        )
+        xs, ys, zvals = xs[good], ys[good], zvals[good]
+        if xs.size < 10:
+            return None
+        span = float(zvals.max() - zvals.min())
+        if span >= 0.012:
+            keep = zvals >= float(np.percentile(zvals, 55.0))
+        else:
+            keep = zvals <= float(np.percentile(zvals, self.near_percentile))
+        xs, ys, zvals = xs[keep], ys[keep], zvals[keep]
+        if xs.size < 8:
+            return None
+        return float(np.mean(xs)), float(np.mean(ys)), float(np.median(zvals))
 
     def cube_yaw_base(self, rect, depth_z: float, camera_info: CameraInfo, stamp) -> Optional[float]:
         """Yaw of one cube edge in base_link, wrapped to [0, pi/2)."""
@@ -429,15 +452,16 @@ class CubeDetector(Node):
         if scale <= 0.0:
             return None
         p = o + scale * direction
-        b = self.bounds
-        if not (
-            b["x_min"] <= p[0] <= b["x_max"]
-            and b["y_min"] <= p[1] <= b["y_max"]
-            and float(np.hypot(p[0], p[1])) <= b["r_max"]
-        ):
-            return None
         p[2] = self.table_z
         return p
+
+    def in_cube_workspace_xy(self, x: float, y: float) -> bool:
+        b = self.bounds
+        return (
+            b["x_min"] <= x <= b["x_max"]
+            and b["y_min"] <= y <= b["y_max"]
+            and float(math.hypot(x, y)) <= b["r_max"]
+        )
 
     def box_measurement(
         self, contour, camera_info: CameraInfo, stamp, image_shape
@@ -461,6 +485,9 @@ class CubeDetector(Node):
         # edge, so do not reject an otherwise valid candidate solely for that.
         base = self.ray_table_intersection(float(u), float(v), camera_info, stamp)
         if base is None:
+            return None
+        # The drop box can sit slightly outside the cube grasp envelope.
+        if float(math.hypot(base[0], base[1])) > 0.70:
             return None
         return {
             "pixel": (float(u), float(v)),
@@ -535,7 +562,7 @@ class CubeDetector(Node):
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
-            candidates = [
+            measured = [
                 result
                 for result in (
                     self.contour_measurement(c, depth, info, msg.header.stamp)
@@ -543,6 +570,21 @@ class CubeDetector(Node):
                 )
                 if result is not None
             ]
+            candidates = [item for item in measured if item.get("reject") is None]
+            rejected = [item for item in measured if item.get("reject")]
+            color = DRAW_COLORS[name]
+            for item in rejected:
+                u, v = item["pixel"]
+                cv2.drawContours(debug, [item["contour"]], -1, color, 1)
+                cv2.putText(
+                    debug,
+                    f"{name.upper()} {item['reject']}",
+                    (round(u) + 8, round(v) - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    1,
+                )
             if not candidates:
                 self.histories[name].clear()
                 self.yaw_histories[name].clear()
