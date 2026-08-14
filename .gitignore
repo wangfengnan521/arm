@@ -39,6 +39,15 @@ core.*
 *.gv
 frames.pdf
 
+# Local HTTPS certs for the phone web demo
+src/x5a_web_agent/certs/*.pem
+
+# Android build output
+android/**/.gradle/
+android/**/build/
+android/**/local.properties
+android/**/*.iml
+
 # Calibration runtime output (the verified input set is explicitly retained)
 src/x5a_handeye/data/*
 !src/x5a_handeye/data/manual_samples_readonly.json

@@ -2,6 +2,21 @@
 
 稳定抓取路径是 **Python `x5a_pick_place`**，不要用 `./x5a_pick.sh`（那是实验性 MTC）。
 
+## 手机 / QQ 语音抓取 Demo
+
+机械臂主机没有麦克风。推荐用安卓 App 录音，主机用本地 `faster-whisper` 识别，再经 `/x5a/pick_place` 调用现有视觉抓取。不绕过 MoveIt，也不额外发布 `/arm_cmd`。
+
+支持：
+
+- 红 / 白 / 橙
+- 「把最近的 / 最远的放入盒子」
+- 「把红色和白色放入盒子」（队列连续抓，中间回 Ready，盒子坐标只冻结一次）
+- QQ 群 OneBot 机器人（Napcat / Lagrange）
+
+安卓 APK：`android/X5A语音抓取.apk`（自动连接 `192.168.0.50:8000`）
+
+完整说明：[docs/VOICE_INTERACTION.md](docs/VOICE_INTERACTION.md)。
+
 ## 一键视觉抓取
 
 机械臂、RealSense、CANable2 正确连接后：
@@ -113,10 +128,12 @@ X5A -> CAN -> X5Controller -> /arm_status (RobotStatus)
 | `x5a_moveit_config` | MoveIt 2 模型、规划参数、控制器映射、真机 bringup |
 | `x5a_moveit_official_adapter` | `/arm_status` 状态适配，FJT/Gripper action 到官方 `/arm_cmd` |
 | `x5a_pick_place` | **正式**视觉/固定坐标抓放状态机 |
+| `x5a_task_server` | 长期运行的 `/x5a/pick_place` Action，复用 `x5a_pick_place` |
+| `x5a_web_agent` | 手机网页、语音文字、规则解析、Action Client |
 | `x5a_vision` | HSV + RGB-D + TF2 的红/白/橙方块及黑色海绵中心定位 |
 | `x5a_handeye` | ChArUco 检测、采样、Eye-to-Hand 求解、验证与 TF 发布 |
 | `x5a_mtc_pick_place` | 实验性 MTC 整链规划；日常抓取不要用 |
-| `x5a_task_interfaces` | MTC 用的 `PickPlace` action |
+| `x5a_task_interfaces` | MTC 的 `PickPlace` 以及语音链路的 `X5aPickPlace` action |
 | `x5a_control_bridge` | 早期实验 bridge；稳定真机链不启动 |
 
 厂商 `arx5_arm_msg`、`arx_x5_controller` 和 SDK 保持为外部依赖，详情见 [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)。

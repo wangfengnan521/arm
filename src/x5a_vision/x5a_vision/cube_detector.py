@@ -23,6 +23,15 @@ from tf2_geometry_msgs import do_transform_point
 from tf2_ros import Buffer, TransformException, TransformListener
 
 
+def wrap_half_pi(yaw: float) -> float:
+    """Wrap yaw into [0, pi/2) — a cube has 90-degree face symmetry."""
+    period = 0.5 * math.pi
+    wrapped = math.fmod(float(yaw), period)
+    if wrapped < 0.0:
+        wrapped += period
+    return wrapped
+
+
 COLORS = ("red", "white", "orange")
 DRAW_COLORS = {
     "red": (0, 0, 255),
@@ -41,6 +50,7 @@ class CubeDetector(Node):
         self.color_msg: Optional[Image] = None
         self.info: Optional[CameraInfo] = None
         self.histories = {name: deque(maxlen=self.window) for name in COLORS}
+        self.yaw_histories = {name: deque(maxlen=self.window) for name in COLORS}
         self.box_history = deque(maxlen=self.box_window)
         self.last_log_ns = 0
         self.depth_encoding_logged = False
@@ -334,6 +344,7 @@ class CubeDetector(Node):
         if abs(p[2] - (self.table_z + self.object_height)) > self.table_tol:
             return None
         x, y, wb, hb = cv2.boundingRect(contour)
+        yaw = self.cube_yaw_base(rect, z, camera_info, stamp)
         return {
             "area": area,
             "pixel": (u, v),
@@ -342,8 +353,44 @@ class CubeDetector(Node):
             "base": p,
             "bbox": (x, y, wb, hb),
             "contour": contour,
+            "rect": rect,
+            "yaw": yaw,
             "score": float(np.linalg.norm(p[:2] - self.expected_xy)),
         }
+
+    def cube_yaw_base(self, rect, depth_z: float, camera_info: CameraInfo, stamp) -> Optional[float]:
+        """Yaw of one cube edge in base_link, wrapped to [0, pi/2)."""
+        corners = cv2.boxPoints(rect)
+        d01 = float(np.linalg.norm(corners[1] - corners[0]))
+        d12 = float(np.linalg.norm(corners[2] - corners[1]))
+        a, b = (corners[0], corners[1]) if d01 >= d12 else (corners[1], corners[2])
+        pa = self.pixel_to_base(float(a[0]), float(a[1]), depth_z, camera_info, stamp)
+        pb = self.pixel_to_base(float(b[0]), float(b[1]), depth_z, camera_info, stamp)
+        if pa is None or pb is None:
+            return None
+        yaw = math.atan2(pb[1] - pa[1], pb[0] - pa[0])
+        return wrap_half_pi(yaw)
+
+    def pixel_to_base(
+        self, u: float, v: float, z: float, camera_info: CameraInfo, stamp
+    ) -> Optional[np.ndarray]:
+        fx, fy = float(camera_info.k[0]), float(camera_info.k[4])
+        cx, cy = float(camera_info.k[2]), float(camera_info.k[5])
+        if fx <= 0.0 or fy <= 0.0 or z <= 1e-6:
+            return None
+        point_camera = PointStamped()
+        point_camera.header.stamp = stamp
+        point_camera.header.frame_id = self.optical_frame
+        point_camera.point.x = (u - cx) * z / fx
+        point_camera.point.y = (v - cy) * z / fy
+        point_camera.point.z = float(z)
+        try:
+            point_base = do_transform_point(point_camera, self.lookup_transform(stamp))
+        except TransformException:
+            return None
+        return np.array(
+            [point_base.point.x, point_base.point.y, point_base.point.z], dtype=float
+        )
 
     def ray_table_intersection(
         self, u: float, v: float, camera_info: CameraInfo, stamp
@@ -435,16 +482,31 @@ class CubeDetector(Node):
         values = np.asarray(history)
         return np.median(values, axis=0), np.std(values, axis=0)
 
-    def publish_pose(self, publisher, stamp, xyz: np.ndarray) -> PoseStamped:
+    def publish_pose(
+        self, publisher, stamp, xyz: np.ndarray, yaw: Optional[float] = None
+    ) -> PoseStamped:
         pose = PoseStamped()
         pose.header.stamp = stamp
         pose.header.frame_id = self.base_frame
         pose.pose.position.x = float(xyz[0])
         pose.pose.position.y = float(xyz[1])
         pose.pose.position.z = float(xyz[2])
-        pose.pose.orientation.w = 1.0
+        if yaw is None:
+            pose.pose.orientation.w = 1.0
+        else:
+            half = 0.5 * float(yaw)
+            pose.pose.orientation.z = math.sin(half)
+            pose.pose.orientation.w = math.cos(half)
         publisher.publish(pose)
         return pose
+
+    @staticmethod
+    def median_yaw_90(yaws) -> Optional[float]:
+        if not yaws:
+            return None
+        angs = np.asarray(yaws, dtype=float) * 4.0
+        yaw = 0.25 * math.atan2(float(np.mean(np.sin(angs))), float(np.mean(np.cos(angs))))
+        return wrap_half_pi(yaw)
 
     def on_depth(self, msg: Image) -> None:
         with self.lock:
@@ -483,6 +545,7 @@ class CubeDetector(Node):
             ]
             if not candidates:
                 self.histories[name].clear()
+                self.yaw_histories[name].clear()
                 self.stable_pubs[name].publish(Bool(data=False))
                 if name == "red":
                     self.stable_pub.publish(Bool(data=False))
@@ -492,11 +555,16 @@ class CubeDetector(Node):
             median, std = self.update_history(
                 self.histories[name], best["base"], self.reset_distance
             )
+            if len(self.histories[name]) <= 1:
+                self.yaw_histories[name].clear()
+            if best.get("yaw") is not None:
+                self.yaw_histories[name].append(float(best["yaw"]))
+            yaw = self.median_yaw_90(self.yaw_histories[name])
             stable = len(self.histories[name]) >= self.window and bool(
                 np.all(std <= self.max_std)
             )
             pose = self.publish_pose(
-                self.pose_pubs[name], msg.header.stamp, median
+                self.pose_pubs[name], msg.header.stamp, median, yaw
             )
             self.stable_pubs[name].publish(Bool(data=stable))
             if name == "red":

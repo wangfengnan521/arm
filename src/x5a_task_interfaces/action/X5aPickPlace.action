@@ -1,0 +1,11 @@
+# Persistent visual pick-and-place goal used by x5a_task_server.
+# Keep this separate from PickPlace.action (MTC uses field "color").
+string target_color
+# Sequence optimizations. Defaults keep single-task behavior.
+bool skip_return_home
+bool reuse_frozen_box
+---
+bool success
+string message
+---
+string stage

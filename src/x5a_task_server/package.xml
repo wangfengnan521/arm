@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>x5a_task_server</name>
+  <version>0.1.0</version>
+  <description>Persistent ROS 2 Action server that reuses x5a_pick_place for voice/web tasks.</description>
+  <maintainer email="user@example.com">x5a user</maintainer>
+  <license>BSD</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>x5a_pick_place</depend>
+  <depend>x5a_task_interfaces</depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

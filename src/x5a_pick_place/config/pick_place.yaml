@@ -5,12 +5,12 @@
       group: arm
       base_frame: base_link
       tcp_frame: tool0
-      transit_velocity_scaling: 0.75
-      transit_acceleration_scaling: 0.38
-      precision_velocity_scaling: 0.28
-      precision_acceleration_scaling: 0.16
-      lift_retreat_velocity_scaling: 0.35
-      lift_retreat_acceleration_scaling: 0.20
+      transit_velocity_scaling: 0.82
+      transit_acceleration_scaling: 0.43
+      precision_velocity_scaling: 0.33
+      precision_acceleration_scaling: 0.19
+      lift_retreat_velocity_scaling: 0.40
+      lift_retreat_acceleration_scaling: 0.24
       planning_time: 5.0
       max_attempts: 6
     # Keep contact poses vertical. High transit poses use a smaller pitch so
@@ -60,7 +60,7 @@
     grasp:
       x_offset: 0.0
       y_offset: 0.0
-      z_offset: 0.040
+      z_offset: 0.030
     gripper:
       action_name: /x5a_gripper_controller/gripper_cmd
       open_position_m: 0.044
@@ -68,6 +68,6 @@
       max_effort: 0.0
       timeout: 3.0
     ready_joints: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    # Workspace-facing hover used before the first Cartesian approach.
-    # joint1 is overwritten with atan2(target_y, target_x) at runtime.
-    pre_grasp_ready_joints: [0.0, 0.85, 0.95, -0.55, 0.0, 0.0]
+    # Workspace hover. joint1 faces the eye-to-hand camera (atan2(0.28, 0.32)).
+    # Per-target approach still overwrites joint1 with atan2(target_y, target_x).
+    pre_grasp_ready_joints: [0.72, 0.85, 0.95, -0.55, 0.0, 0.0]

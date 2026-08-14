@@ -14,7 +14,7 @@ import math
 import sys
 import threading
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import rclpy
 from rclpy.action import ActionClient
@@ -57,6 +57,9 @@ ARM_JOINTS = [
     "joint5",
     "joint6",
 ]
+ALLOWED_COLORS = ("red", "white", "orange")
+ALLOWED_SELECTORS = ("nearest", "farthest")
+ALLOWED_TARGETS = ALLOWED_COLORS + ALLOWED_SELECTORS
 
 
 def rpy_to_quat(roll: float, pitch: float, yaw: float) -> Quaternion:
@@ -84,6 +87,12 @@ def pose_xyz_quat(
 
 def pose_to_xyz(pose: Pose) -> Tuple[float, float, float]:
     return (pose.position.x, pose.position.y, pose.position.z)
+
+
+def quat_to_yaw(q: Quaternion) -> float:
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
 
 
 def wrap_pi(angle: float) -> float:
@@ -114,8 +123,8 @@ def unique_rpy(
 
 
 class PickPlaceNode(Node):
-    def __init__(self) -> None:
-        super().__init__("x5a_pick_place")
+    def __init__(self, node_name: str = "x5a_pick_place") -> None:
+        super().__init__(node_name)
         self.cb = ReentrantCallbackGroup()
         self._declare_params()
         self._load_params()
@@ -127,12 +136,31 @@ class PickPlaceNode(Node):
             JointState, self.joint_state_topic, self._joint_state_cb, 10,
             callback_group=self.cb
         )
-        self.create_subscription(
-            PoseStamped, self.vision_pose_topic, self._vision_pose_cb, 10, callback_group=self.cb
-        )
-        self.create_subscription(
-            Bool, self.vision_stable_topic, self._vision_stable_cb, 10, callback_group=self.cb
-        )
+        self.allowed_colors = ALLOWED_COLORS
+        self.cube_poses: Dict[str, Optional[PoseStamped]] = {
+            color: None for color in self.allowed_colors
+        }
+        self.cube_pose_arrivals: Dict[str, float] = {
+            color: 0.0 for color in self.allowed_colors
+        }
+        self.cube_stable: Dict[str, bool] = {
+            color: False for color in self.allowed_colors
+        }
+        for color in self.allowed_colors:
+            self.create_subscription(
+                PoseStamped,
+                f"/x5a_vision/{color}_cube_pose",
+                self._make_cube_pose_cb(color),
+                10,
+                callback_group=self.cb,
+            )
+            self.create_subscription(
+                Bool,
+                f"/x5a_vision/{color}_cube_stable",
+                self._make_cube_stable_cb(color),
+                10,
+                callback_group=self.cb,
+            )
         self.create_subscription(
             PoseStamped, self.box_pose_topic, self._box_pose_cb, 10,
             callback_group=self.cb
@@ -147,6 +175,9 @@ class PickPlaceNode(Node):
         self.box_pose: Optional[PoseStamped] = None
         self.box_pose_arrival = 0.0
         self.box_stable = False
+        self._stage_callback: Optional[Callable[[str], None]] = None
+        self._cancel_requested = False
+        self._session_box_xyz: Optional[Tuple[float, float, float]] = None
 
         self.move_ac = ActionClient(self, MoveGroup, "move_action", callback_group=self.cb)
         self.execute_ac = ActionClient(
@@ -266,7 +297,7 @@ class PickPlaceNode(Node):
         self.joint_state_topic = str(g("state.joint_state_topic").value)
         self.vision_enabled = bool(g("vision.enabled").value)
         self.target_color = str(g("target_color").value).strip().lower()
-        if self.target_color not in ("red", "white", "orange"):
+        if self.target_color not in ALLOWED_COLORS:
             raise ValueError(
                 f"target_color must be red, white, or orange; got {self.target_color!r}"
             )
@@ -326,14 +357,104 @@ class PickPlaceNode(Node):
         if "joint7" in index and index["joint7"] < len(msg.position):
             self.gripper_position = float(msg.position[index["joint7"]])
 
-    def _vision_pose_cb(self, msg: PoseStamped) -> None:
+    def _make_cube_pose_cb(self, color: str):
+        def _cb(msg: PoseStamped) -> None:
+            self._cube_pose_cb(color, msg)
+        return _cb
+
+    def _make_cube_stable_cb(self, color: str):
+        def _cb(msg: Bool) -> None:
+            self._cube_stable_cb(color, msg)
+        return _cb
+
+    def _cube_pose_cb(self, color: str, msg: PoseStamped) -> None:
         if msg.header.frame_id != self.base_frame:
             return
-        self.vision_pose = msg
-        self.vision_pose_arrival = time.monotonic()
+        self.cube_poses[color] = msg
+        self.cube_pose_arrivals[color] = time.monotonic()
+        if color == self.target_color:
+            self.vision_pose = msg
+            self.vision_pose_arrival = self.cube_pose_arrivals[color]
+
+    def _cube_stable_cb(self, color: str, msg: Bool) -> None:
+        self.cube_stable[color] = bool(msg.data)
+        if color == self.target_color:
+            self.vision_stable = bool(msg.data)
+
+    def _vision_pose_cb(self, msg: PoseStamped) -> None:
+        self._cube_pose_cb(self.target_color, msg)
 
     def _vision_stable_cb(self, msg: Bool) -> None:
-        self.vision_stable = bool(msg.data)
+        self._cube_stable_cb(self.target_color, msg)
+
+    def set_stage_callback(self, callback: Optional[Callable[[str], None]]) -> None:
+        self._stage_callback = callback
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
+
+    def _cancelled(self) -> bool:
+        return bool(self._cancel_requested)
+
+    def report_stage(self, stage: str, **kwargs) -> None:
+        self.log_stage(stage, **kwargs)
+        callback = self._stage_callback
+        if callback is None:
+            return
+        try:
+            callback(stage)
+        except Exception as exc:
+            self.get_logger().warn(f"stage callback failed: {exc}")
+
+    def reset_task_state(self, target_color: str) -> None:
+        """Drop frozen poses from the previous task before a new color is selected."""
+        color = target_color.strip().lower()
+        self.target_color = color
+        self.vision_pose_topic = f"/x5a_vision/{color}_cube_pose"
+        self.vision_stable_topic = f"/x5a_vision/{color}_cube_stable"
+        for name in self.allowed_colors:
+            self.cube_poses[name] = None
+            self.cube_pose_arrivals[name] = 0.0
+            self.cube_stable[name] = False
+        self.vision_pose = None
+        self.vision_pose_arrival = 0.0
+        self.vision_stable = False
+        self.box_pose = None
+        self.box_pose_arrival = 0.0
+        self.box_stable = False
+        self.last_joints = None
+        self._cancel_requested = False
+        self.get_logger().info(f"reset task state target_color={color}")
+
+    def clear_planning_scene_objects(self) -> None:
+        """Remove leftover attached/world objects so the next task can rebuild the scene."""
+        aco = AttachedCollisionObject()
+        aco.object.id = "object"
+        aco.object.header.frame_id = self.tcp_frame
+        aco.object.header.stamp = self.get_clock().now().to_msg()
+        aco.object.operation = CollisionObject.REMOVE
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.robot_state.is_diff = True
+        scene.robot_state.attached_collision_objects = [aco]
+        self.scene_pub.publish(scene)
+        self.publish_box(
+            "object",
+            [0.0, 0.0, 0.0],
+            [0.01, 0.01, 0.01],
+            operation=CollisionObject.REMOVE,
+        )
+        time.sleep(0.1)
+
+    def handeye_tf_ok(self) -> bool:
+        try:
+            self.tf_buffer.lookup_transform(
+                "base_link", "camera_link", Time(), timeout=Duration(seconds=0.5)
+            )
+            return True
+        except Exception as exc:
+            self.get_logger().error(f"TF base_link->camera_link unavailable: {exc}")
+            return False
 
     def _box_pose_cb(self, msg: PoseStamped) -> None:
         if msg.header.frame_id != self.base_frame:
@@ -901,12 +1022,25 @@ class PickPlaceNode(Node):
     def pose_rpy(self, x: float, y: float, z: float, rpy: Sequence[float]) -> Pose:
         return pose_xyz_quat(x, y, z, rpy_to_quat(rpy[0], rpy[1], rpy[2]))
 
-    def grasp_orientation_candidates(self, x: float, y: float) -> List[List[float]]:
-        # Verified contact orientation first. Large radial yaw rotates the
-        # finger pads off a cube even when tool0 is on the visual point.
+    def grasp_orientation_candidates(
+        self,
+        x: float,
+        y: float,
+        cube_yaw: Optional[float] = None,
+    ) -> List[List[float]]:
+        # Align finger pads with a pair of opposite cube faces. A 45-degree
+        # offset closes on adjacent faces and the cube slips out.
         yaw0 = math.atan2(y, x)
         pitch = float(self.grasp_rpy[1]) if len(self.grasp_rpy) > 1 else 1.45
-        cands = [list(self.grasp_rpy), [0.0, pitch, 0.20], [0.0, pitch, -0.20]]
+        cands: List[List[float]] = []
+        if cube_yaw is not None:
+            for axis in (cube_yaw, cube_yaw + 0.5 * math.pi):
+                yaw = wrap_pi(axis)
+                cands.append([0.0, pitch, yaw])
+                cands.append([0.0, pitch, wrap_pi(yaw + math.pi)])
+        else:
+            cands.extend([[0.0, pitch, 0.0], [0.0, pitch, 0.5 * math.pi]])
+        cands.extend([list(self.grasp_rpy), [0.0, pitch, 0.20], [0.0, pitch, -0.20]])
         if math.hypot(x, y) >= 0.42:
             cands.extend([[0.0, pitch, yaw0], [0.0, 1.30, yaw0]])
         return unique_rpy(cands)
@@ -957,12 +1091,25 @@ class PickPlaceNode(Node):
     def move_pre_grasp_ready(self, x: float, y: float) -> bool:
         joints = list(self.pre_grasp_ready_joints)
         if len(joints) < 6:
-            joints = [0.0, 0.85, 0.95, -0.55, 0.0, 0.0]
+            joints = [0.72, 0.85, 0.95, -0.55, 0.0, 0.0]
         joints[0] = math.atan2(y, x)
         self.log_stage("MOVE_READY", joints=[round(v, 3) for v in joints])
         return self.move_joints(
             joints, "MOVE_READY", self.transit_vel, self.transit_acc
         )
+
+    def camera_facing_ready_joints(self) -> List[float]:
+        joints = list(self.pre_grasp_ready_joints)
+        if len(joints) < 6:
+            joints = [0.72, 0.85, 0.95, -0.55, 0.0, 0.0]
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "base_link", "camera_link", Time(), timeout=Duration(seconds=0.3)
+            )
+            joints[0] = math.atan2(tf.transform.translation.y, tf.transform.translation.x)
+        except Exception:
+            pass
+        return joints
 
     def log_calibration(self) -> None:
         try:
@@ -996,31 +1143,58 @@ class PickPlaceNode(Node):
 
     def wait_for_frozen_vision(
         self,
+        reuse_frozen_box: bool = False,
     ) -> Optional[
         Tuple[Tuple[float, float, float], Tuple[float, float, float]]
     ]:
-        """Freeze the selected cube and movable-box poses together."""
+        """Freeze the selected cube. Box is frozen once per sequence when requested."""
+        reuse_box = bool(reuse_frozen_box and self._session_box_xyz is not None)
         deadline = time.monotonic() + self.vision_wait_timeout
         self.log_stage(
             "WAIT_FOR_VISION",
             target_color=self.target_color,
             timeout=self.vision_wait_timeout,
+            reuse_frozen_box=reuse_box,
         )
+        if reuse_box:
+            self.log_stage("REUSE_FROZEN_BOX", box_xyz=self._session_box_xyz)
         while time.monotonic() < deadline:
+            if self._cancelled():
+                self.log_stage(
+                    "WAIT_FOR_VISION", result="CANCELLED",
+                    target_color=self.target_color,
+                )
+                return None
             now = time.monotonic()
-            cube_age = now - self.vision_pose_arrival
-            box_age = now - self.box_pose_arrival
-            if (
-                self.vision_pose is not None
-                and self.box_pose is not None
-                and self.vision_stable
-                and self.box_stable
+            pose = self.cube_poses.get(self.target_color)
+            arrival = self.cube_pose_arrivals.get(self.target_color, 0.0)
+            stable = self.cube_stable.get(self.target_color, False)
+            cube_age = now - arrival
+            cube_ok = (
+                pose is not None
+                and stable
                 and cube_age <= self.vision_max_age
-                and box_age <= self.vision_max_age
-            ):
-                cube_xyz = pose_to_xyz(self.vision_pose.pose)
-                box_xyz = pose_to_xyz(self.box_pose.pose)
+            )
+            if reuse_box:
+                box_ok = True
+                box_xyz = self._session_box_xyz
+                box_age = 0.0
+            else:
+                box_age = now - self.box_pose_arrival
+                box_ok = (
+                    self.box_pose is not None
+                    and self.box_stable
+                    and box_age <= self.vision_max_age
+                )
+                box_xyz = pose_to_xyz(self.box_pose.pose) if self.box_pose is not None else None
+            if cube_ok and box_ok and pose is not None and box_xyz is not None:
+                cube_xyz = pose_to_xyz(pose.pose)
                 if all(math.isfinite(v) for v in cube_xyz + box_xyz):
+                    self.vision_pose = pose
+                    self.vision_pose_arrival = arrival
+                    self.vision_stable = True
+                    if not reuse_box:
+                        self._session_box_xyz = box_xyz
                     self.log_stage(
                         "STABLE_DETECTION",
                         target_color=self.target_color,
@@ -1028,33 +1202,125 @@ class PickPlaceNode(Node):
                         box_age=box_age,
                         cube_xyz=cube_xyz,
                         box_xyz=box_xyz,
+                        reused_box=reuse_box,
                     )
                     self.log_stage(
                         "FREEZE_POSES",
                         target_color=self.target_color,
                         cube_xyz=cube_xyz,
                         box_xyz=box_xyz,
+                        reused_box=reuse_box,
                     )
                     return cube_xyz, box_xyz
             time.sleep(0.05)
         self.log_stage(
             "WAIT_FOR_VISION", result="FAIL", target_color=self.target_color,
-            cube_stable=self.vision_stable, box_stable=self.box_stable,
-            cube_age=time.monotonic() - self.vision_pose_arrival,
-            box_age=time.monotonic() - self.box_pose_arrival,
+            cube_stable=self.cube_stable.get(self.target_color, False),
+            box_stable=self.box_stable if not reuse_box else True,
+            cube_age=time.monotonic() - self.cube_pose_arrivals.get(self.target_color, 0.0),
+            box_age=0.0 if reuse_box else time.monotonic() - self.box_pose_arrival,
+            reuse_frozen_box=reuse_box,
         )
         return None
 
-    def run(self) -> int:
+    def _fail(self, message: str) -> Tuple[bool, str]:
+        self.report_stage("FAILED", reason=message)
+        return False, message
+
+    def _cube_candidates(self, max_age: float = 2.0, require_stable: bool = False):
+        now = time.monotonic()
+        box = self.box_pose
+        if box is None or (now - self.box_pose_arrival) > max_age:
+            return [], "没有看到放置盒子"
+        box_xy = (box.pose.position.x, box.pose.position.y)
+        found = []
+        for color in ALLOWED_COLORS:
+            pose = self.cube_poses.get(color)
+            arrival = self.cube_pose_arrivals.get(color, 0.0)
+            if pose is None or (now - arrival) > max_age:
+                continue
+            if require_stable and not self.cube_stable.get(color, False):
+                continue
+            xyz = pose_to_xyz(pose.pose)
+            if not all(math.isfinite(v) for v in xyz):
+                continue
+            dist = math.hypot(xyz[0] - box_xy[0], xyz[1] - box_xy[1])
+            found.append((dist, color, xyz))
+        if not found:
+            return [], "没有看到可抓取的方块"
+        found.sort(key=lambda item: item[0])
+        return found, ""
+
+    def select_color_by_box_distance(self, selector: str) -> Tuple[Optional[str], str]:
+        """Pick the cube nearest to or farthest from the box center (XY)."""
+        name = selector.strip().lower()
+        if name not in ALLOWED_SELECTORS:
+            return None, f"invalid selector: {selector!r}"
+        deadline = time.monotonic() + max(3.0, min(self.vision_wait_timeout, 8.0))
+        last_err = "没有看到可抓取的方块"
+        while time.monotonic() < deadline:
+            if self._cancelled():
+                return None, "任务已取消"
+            candidates, err = self._cube_candidates(require_stable=True)
+            if not candidates:
+                candidates, err = self._cube_candidates(require_stable=False)
+            if candidates:
+                chosen = candidates[0] if name == "nearest" else candidates[-1]
+                detail = ", ".join(
+                    f"{color}={dist:.3f}m" for dist, color, _xyz in candidates
+                )
+                self.report_stage(
+                    "SELECT_BY_BOX",
+                    selector=name,
+                    chosen=chosen[1],
+                    distance=chosen[0],
+                    ranking=detail,
+                )
+                return chosen[1], ""
+            last_err = err
+            time.sleep(0.05)
+        return None, last_err
+
+    def execute_pick_place(
+        self,
+        target_color: str,
+        skip_return_home: bool = False,
+        reuse_frozen_box: bool = False,
+    ) -> Tuple[bool, str]:
+        """Run one verified pick-place cycle and stay alive for the next command."""
+        color = str(target_color or "").strip().lower()
+        if not reuse_frozen_box:
+            self._session_box_xyz = None
+        if color in ALLOWED_SELECTORS:
+            if not self.vision_enabled:
+                return self._fail("nearest/farthest requires vision")
+            self.report_stage("WAITING_VISION", selector=color)
+            resolved, err = self.select_color_by_box_distance(color)
+            if resolved is None:
+                return self._fail(err)
+            self.report_stage("TARGET_FOUND", selector=color, target_color=resolved)
+            color = resolved
+        if color not in ALLOWED_COLORS:
+            return self._fail(f"invalid target_color: {target_color!r}")
+
+        self.reset_task_state(color)
+        self.clear_planning_scene_objects()
+
         if not self.wait_ready():
             self.get_logger().error("dependencies not ready")
-            return 2
+            return self._fail("dependencies not ready")
         self.log_calibration()
 
         if self.vision_enabled:
-            frozen = self.wait_for_frozen_vision()
+            if not self.handeye_tf_ok():
+                return self._fail("TF base_link->camera_link unavailable")
+            self.report_stage("WAITING_VISION", target_color=color)
+            frozen = self.wait_for_frozen_vision(reuse_frozen_box=reuse_frozen_box)
             if frozen is None:
-                return 1
+                if self._cancelled():
+                    return self._fail("任务已取消")
+                return self._fail(f"vision not stable for {color}")
+            self.report_stage("TARGET_FOUND", target_color=color)
             (top_x, top_y, top_z), (box_x, box_y, _) = frozen
         else:
             top_x, top_y, top_z = self.obj_x, self.obj_y, self.obj_z + self.obj_sz * 0.5
@@ -1074,7 +1340,11 @@ class PickPlaceNode(Node):
         place_z = self.place_z
         self.setup_scene()
 
-        grasp_oris = self.grasp_orientation_candidates(grasp_x, grasp_y)
+        cube_yaw = None
+        if self.vision_enabled and self.vision_pose is not None:
+            cube_yaw = quat_to_yaw(self.vision_pose.pose.orientation)
+            self.log_stage("CUBE_YAW", yaw=cube_yaw)
+        grasp_oris = self.grasp_orientation_candidates(grasp_x, grasp_y, cube_yaw)
         place_oris = self.place_orientation_candidates(place_x, place_y)
         self.log_stage(
             "POSES", visual_top=(top_x, top_y, top_z),
@@ -1086,18 +1356,24 @@ class PickPlaceNode(Node):
             place_rpy_candidates=[[round(v, 3) for v in rpy] for rpy in place_oris],
         )
 
+        if self._cancelled():
+            return self._fail("任务已取消")
         if not self.call_gripper(True):
-            return 1
+            return self._fail("open gripper failed")
+        self.report_stage("MOVE_READY")
         if not self.move_pre_grasp_ready(grasp_x, grasp_y):
             self.log_stage("MOVE_READY", result="WARN_CONTINUE")
         # Approach and contact share one orientation. Switching pitch/yaw on
         # the last 8 cm is what twisted the wrist and pinned joint4.
+        if self._cancelled():
+            return self._fail("任务已取消")
+        self.report_stage("MOVE_PRE_GRASP")
         chosen_grasp = self.move_pose_candidates(
             grasp_x, grasp_y, grasp_z + self.pre_grasp_h,
             grasp_oris, "MOVE_PRE_GRASP", self.transit_vel, self.transit_acc,
         )
         if chosen_grasp is None:
-            return 1
+            return self._fail("pre-grasp planning failed")
         grasp = self.pose_rpy(grasp_x, grasp_y, grasp_z, chosen_grasp)
         # The visual object was used for scene construction. Remove it immediately
         # before contact so the gripper is allowed to enter the grasp volume.
@@ -1106,64 +1382,87 @@ class PickPlaceNode(Node):
             [self.obj_sx, self.obj_sy, self.obj_sz], operation=CollisionObject.REMOVE,
         )
         time.sleep(0.15)
+        if self._cancelled():
+            return self._fail("任务已取消")
+        self.report_stage("APPROACH")
         ok, frac_app = self.vertical_move(
             grasp, "APPROACH", self.precision_vel, self.precision_acc
         )
         if not ok:
-            return 1
+            return self._fail("approach planning or execution failed")
+        self.report_stage("GRASPING")
         if not self.call_gripper(False):
-            return 1
+            return self._fail("close gripper failed")
         self.attach_object()
 
         # Construct lift from the actual TCP after grasp. In plan-only mode the
         # planned grasp pose is the current logical TCP.
         lift_start = pose_to_xyz(grasp) if self.plan_only else self.current_tcp()
         if lift_start is None:
-            return 1
+            return self._fail("no TCP after grasp")
         lift = self.pose_rpy(
             lift_start[0], lift_start[1], lift_start[2] + self.lift_h, chosen_grasp
         )
+        self.report_stage("LIFTING")
         ok, frac_lift = self.vertical_move(
             lift, "LIFT", self.lift_retreat_vel, self.lift_retreat_acc
         )
         if not ok:
-            return 1
+            return self._fail("lift planning or execution failed")
+        if self._cancelled():
+            return self._fail("任务已取消")
+        self.report_stage("MOVE_PRE_PLACE")
         chosen_place = self.move_pose_candidates(
             place_x, place_y, place_z + self.pre_place_h,
             place_oris, "MOVE_PRE_PLACE", self.transit_vel, self.transit_acc,
             xy_offsets=[(0.0, 0.0), (0.01, 0.0), (0.0, -0.01)],
         )
         if chosen_place is None:
-            return 1
+            return self._fail("pre-place planning failed")
         place = self.pose_rpy(place_x, place_y, place_z, chosen_place)
+        self.report_stage("DESCENDING")
         ok, frac_desc = self.vertical_move(
             place, "DESCEND", self.precision_vel, self.precision_acc
         )
         if not ok:
-            return 1
+            return self._fail("descend planning or execution failed")
+        self.report_stage("RELEASING")
         if not self.call_gripper(True):
-            return 1
+            return self._fail("release gripper failed")
         table_top = self.table_z + 0.5 * self.table_sz
         self.detach_object([place_x, place_y, table_top + 0.5 * self.obj_sz])
         retreat_start = pose_to_xyz(place) if self.plan_only else self.current_tcp()
         if retreat_start is None:
-            return 1
+            return self._fail("no TCP after place")
         retreat = self.pose_rpy(
             retreat_start[0], retreat_start[1], retreat_start[2] + self.retreat_h,
             chosen_place,
         )
+        self.report_stage("RETREATING")
         ok, frac_ret = self.vertical_move(
             retreat, "RETREAT", self.lift_retreat_vel, self.lift_retreat_acc
         )
         if not ok:
-            return 1
-        if not self.move_joints(
-            self.ready_joints,
-            "RETURN_HOME",
-            self.transit_vel,
-            self.transit_acc,
-        ):
-            self.log_stage("RETURN_HOME", result="WARN_CONTINUE")
+            return self._fail("retreat planning or execution failed")
+        if skip_return_home:
+            ready = self.camera_facing_ready_joints()
+            self.report_stage("MOVE_READY", joints=[round(v, 3) for v in ready])
+            if not self.move_joints(
+                ready,
+                "MOVE_READY",
+                self.transit_vel,
+                self.transit_acc,
+            ):
+                self.log_stage("MOVE_READY", result="WARN_CONTINUE")
+        else:
+            self.report_stage("RETURN_HOME")
+            if not self.move_joints(
+                self.ready_joints,
+                "RETURN_HOME",
+                self.transit_vel,
+                self.transit_acc,
+            ):
+                self.log_stage("RETURN_HOME", result="WARN_CONTINUE")
 
         self.log_stage(
             "SUMMARY",
@@ -1174,6 +1473,8 @@ class PickPlaceNode(Node):
             plan_only=self.plan_only,
             target_color=self.target_color if self.vision_enabled else "fixed",
             frozen_box_xy=(box_x, box_y),
+            skip_return_home=skip_return_home,
+            reuse_frozen_box=reuse_frozen_box,
         )
         if self.plan_only and self.vision_enabled:
             self.get_logger().info("VISION PICK AND PLACE PLAN: PASS")
@@ -1183,7 +1484,16 @@ class PickPlaceNode(Node):
             self.get_logger().info("VISION PICK AND PLACE: PASS")
         else:
             self.get_logger().info("FIXED-POSE PICK AND PLACE: PASS")
-        return 0
+        self.report_stage("SUCCESS")
+        return True, "任务完成"
+
+    def run(self) -> int:
+        ok, message = self.execute_pick_place(self.target_color)
+        if ok:
+            return 0
+        if message == "dependencies not ready":
+            return 2
+        return 1
 
 
 def main(args=None) -> None:

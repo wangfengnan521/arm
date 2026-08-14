@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg">#0B1220</color>
+    <color name="card">#141C2E</color>
+    <color name="text">#EEF3FF</color>
+    <color name="muted">#93A0BB</color>
+    <color name="accent">#F2B045</color>
+    <color name="ok">#3DD68C</color>
+    <color name="bad">#FF6B6B</color>
+    <color name="red">#D64545</color>
+    <color name="white">#EEF2F8</color>
+    <color name="orange">#F08A24</color>
+    <color name="hold">#F6C15D</color>
+    <color name="holding">#D94A4A</color>
+</resources>
