@@ -33,6 +33,12 @@ def point_time(point: JointTrajectoryPoint) -> float:
     return float(point.time_from_start.sec) + 1e-9 * float(point.time_from_start.nanosec)
 
 
+def now_ns() -> int:
+    # CLOCK_MONOTONIC, same domain as std::chrono::steady_clock in the C++
+    # MTC task server, so timestamps correlate across processes.
+    return time.monotonic_ns()
+
+
 class OfficialTrajectoryAdapter(Node):
     def __init__(self) -> None:
         super().__init__("x5a_official_trajectory_adapter")
@@ -129,6 +135,7 @@ class OfficialTrajectoryAdapter(Node):
         self.declare_parameter("gripper_finger_max_m", 0.044)
         self.declare_parameter("gripper_command_duration_sec", 0.8)
         self.declare_parameter("gripper_goal_tolerance_m", 0.004)
+        self.declare_parameter("gripper_open_threshold_m", 0.03)
 
     def _load_parameters(self) -> None:
         g = lambda name: self.get_parameter(name).value
@@ -158,6 +165,7 @@ class OfficialTrajectoryAdapter(Node):
         self.finger_max = float(g("gripper_finger_max_m"))
         self.gripper_duration = float(g("gripper_command_duration_sec"))
         self.gripper_tolerance = float(g("gripper_goal_tolerance_m"))
+        self.gripper_open_threshold = float(g("gripper_open_threshold_m"))
 
     def finger_position(self, readout: float) -> float:
         span = self.gripper_open - self.gripper_closed
@@ -173,6 +181,44 @@ class OfficialTrajectoryAdapter(Node):
         return self.gripper_closed + fraction * (
             self.gripper_open - self.gripper_closed
         )
+
+    @staticmethod
+    def _fmt_joints(values: Optional[Sequence[float]]) -> str:
+        if values is None:
+            return "[]"
+        return "[" + ",".join(f"{float(v):.4f}" for v in values) + "]"
+
+    def _arm_abort(
+        self,
+        goal_handle,
+        result: FollowJointTrajectory.Result,
+        code: int,
+        reason: str,
+        elapsed: Optional[float] = None,
+        desired: Optional[Sequence[float]] = None,
+        actual: Optional[Sequence[float]] = None,
+    ) -> FollowJointTrajectory.Result:
+        parts = [f"[ARM] ARM_ABORT t_ns={now_ns()} reason={reason}"]
+        if elapsed is not None:
+            parts.append(f"elapsed={elapsed:.3f}")
+        if desired is not None:
+            parts.append(f"desired={self._fmt_joints(desired)}")
+        if actual is not None:
+            parts.append(f"actual={self._fmt_joints(actual)}")
+        if (
+            desired is not None
+            and actual is not None
+            and len(desired) == len(actual) == 6
+        ):
+            error_per_joint = [round(a - d, 4) for a, d in zip(actual, desired)]
+            max_error = max(abs(e) for e in error_per_joint)
+            parts.append(f"error_per_joint={error_per_joint}")
+            parts.append(f"max_error={max_error:.4f}")
+        self.get_logger().error(" ".join(parts))
+        result.error_code = code
+        result.error_string = reason
+        goal_handle.abort()
+        return result
 
     def _status_cb(self, msg: RobotStatus) -> None:
         if len(msg.joint_pos) < 6:
@@ -262,6 +308,14 @@ class OfficialTrajectoryAdapter(Node):
             )
             return GoalResponse.REJECT
         self.goal_active = True
+        start_joint, _, _, _ = self.snapshot()
+        self.get_logger().info(
+            f"[ARM] ARM_GOAL_ACCEPTED t_ns={now_ns()} "
+            f"trajectory_points={len(traj.points)} "
+            f"trajectory_duration={point_time(traj.points[-1]):.3f} "
+            f"start_joint={self._fmt_joints(start_joint)} "
+            f"goal_joint={self._fmt_joints(traj.points[-1].positions)}"
+        )
         return GoalResponse.ACCEPT
 
     @staticmethod
@@ -289,6 +343,12 @@ class OfficialTrajectoryAdapter(Node):
             )
             return GoalResponse.REJECT
         self.goal_active = True
+        _, _, actual_readout, _ = self.snapshot()
+        self.get_logger().info(
+            f"[GRIPPER] GRIPPER_GOAL_ACCEPTED t_ns={now_ns()} "
+            f"target_m={position:.4f} target_vendor={self.gripper_readout(position):.4f} "
+            f"actual_before={self.finger_position(actual_readout):.4f}"
+        )
         return GoalResponse.ACCEPT
 
     def _publish_command(self, joints: Sequence[float], end_pos: Sequence[float], gripper: float) -> None:
@@ -308,6 +368,12 @@ class OfficialTrajectoryAdapter(Node):
         )
         target_readout = self.gripper_readout(target_m)
         try:
+            _, _, actual_readout, _ = self.snapshot()
+            actual_before = self.finger_position(actual_readout)
+            self.get_logger().info(
+                f"[GRIPPER] GRIPPER_EXEC_START t_ns={now_ns()} "
+                f"target_m={target_m:.4f} actual_before={actual_before:.4f}"
+            )
             deadline = time.monotonic() + self.gripper_duration
             period = 1.0 / max(5.0, self.rate_hz)
             while time.monotonic() < deadline:
@@ -316,9 +382,17 @@ class OfficialTrajectoryAdapter(Node):
                     return result
                 q, end_pos, actual_readout, stamp = self.snapshot()
                 if q is None or time.monotonic() - stamp > self.status_timeout:
+                    self.get_logger().error(
+                        f"[GRIPPER] GRIPPER_ABORT t_ns={now_ns()} "
+                        f"reason=official RobotStatus lost target_m={target_m:.4f}"
+                    )
                     goal_handle.abort()
                     return result
                 if self.count_publishers(self.command_topic) != 1:
+                    self.get_logger().error(
+                        f"[GRIPPER] GRIPPER_ABORT t_ns={now_ns()} "
+                        f"reason=another /arm_cmd publisher appeared target_m={target_m:.4f}"
+                    )
                     goal_handle.abort()
                     return result
                 self._publish_command(q, end_pos, target_readout)
@@ -335,15 +409,32 @@ class OfficialTrajectoryAdapter(Node):
             result.position = self.finger_position(actual_readout)
             result.effort = 0.0
             result.stalled = False
+            actual_m = result.position
             # The vendor API exposes a position target but no independent
-            # grasp-complete flag. A complete, continuously published command
-            # is therefore the action success criterion; the measured position
-            # remains in the result for diagnostics.
+            # grasp-complete flag. An OPEN target must actually be reached
+            # (a stuck ~0 m reading must never be reported to MoveIt as
+            # success); a CLOSE target is lenient because a real grasp blocks
+            # the fingers before reaching 0 m.
+            if (
+                target_m > self.gripper_open_threshold
+                and abs(actual_m - target_m) > self.gripper_tolerance
+            ):
+                reason = (
+                    f"open target {target_m:.4f} m not reached; "
+                    f"actual {actual_m:.4f} m"
+                )
+                self.get_logger().error(
+                    f"[GRIPPER] GRIPPER_ABORT t_ns={now_ns()} reason={reason} "
+                    f"target_m={target_m:.4f} actual_after={actual_m:.4f}"
+                )
+                result.reached_goal = False
+                goal_handle.abort()
+                return result
             result.reached_goal = True
             goal_handle.succeed()
             self.get_logger().info(
-                f"gripper command complete: target={target_m:.4f} m "
-                f"feedback={result.position:.4f} m"
+                f"[GRIPPER] GRIPPER_SUCCESS t_ns={now_ns()} "
+                f"target_m={target_m:.4f} actual_after={actual_m:.4f}"
             )
             return result
         finally:
@@ -374,9 +465,10 @@ class OfficialTrajectoryAdapter(Node):
         try:
             q0, end_pos, gripper, _ = self.snapshot()
             if q0 is None:
-                result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
-                result.error_string = "no official RobotStatus"
-                goal_handle.abort(); return result
+                return self._arm_abort(
+                    goal_handle, result, FollowJointTrajectory.Result.INVALID_GOAL,
+                    "no official RobotStatus",
+                )
             raw = [(point_time(p), [float(v) for v in p.positions]) for p in goal_handle.request.trajectory.points]
             if raw[0][0] > 1e-6:
                 points = [(0.0, list(q0))] + raw
@@ -384,20 +476,27 @@ class OfficialTrajectoryAdapter(Node):
                 points = raw
             start_error = max(abs(a - b) for a, b in zip(q0, points[0][1]))
             if start_error > self.start_tolerance:
-                result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
-                result.error_string = f"start error {start_error:.3f} rad"
-                goal_handle.abort(); return result
+                return self._arm_abort(
+                    goal_handle, result, FollowJointTrajectory.Result.INVALID_GOAL,
+                    f"start error {start_error:.3f} rad",
+                    elapsed=0.0, desired=points[0][1], actual=q0,
+                )
             for (ta, qa), (tb, qb) in zip(points, points[1:]):
                 if tb > ta:
                     speed = max(abs(b - a) / (tb - ta) for a, b in zip(qa, qb))
                     if speed > self.max_speed:
-                        result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
-                        result.error_string = f"trajectory speed {speed:.3f} exceeds {self.max_speed:.3f} rad/s"
-                        goal_handle.abort(); return result
+                        return self._arm_abort(
+                            goal_handle, result, FollowJointTrajectory.Result.INVALID_GOAL,
+                            f"trajectory speed {speed:.3f} exceeds {self.max_speed:.3f} rad/s",
+                        )
 
             duration = points[-1][0]
             period = 1.0 / max(5.0, self.rate_hz)
             started = time.monotonic()
+            self.get_logger().info(
+                f"[ARM] ARM_EXEC_START t_ns={now_ns()} "
+                f"trajectory_points={len(points)} trajectory_duration={duration:.3f}"
+            )
             command_count = 0
             response_started: List[Optional[float]] = [None] * 6
             while True:
@@ -409,32 +508,33 @@ class OfficialTrajectoryAdapter(Node):
                 desired = self._desired_at(points, elapsed)
                 actual, latest_end, latest_gripper, stamp = self.snapshot()
                 if actual is None or time.monotonic() - stamp > self.status_timeout:
-                    result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
-                    result.error_string = "official RobotStatus lost during execution"
-                    goal_handle.abort(); return result
+                    return self._arm_abort(
+                        goal_handle, result, FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
+                        "official RobotStatus lost during execution",
+                        elapsed=elapsed, desired=desired,
+                    )
                 if self.count_publishers(self.command_topic) != 1:
-                    result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
-                    result.error_string = "another /arm_cmd publisher appeared"
-                    goal_handle.abort(); return result
+                    return self._arm_abort(
+                        goal_handle, result, FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
+                        "another /arm_cmd publisher appeared",
+                        elapsed=elapsed, desired=desired, actual=actual,
+                    )
                 fault = self.readiness_fault()
                 if fault:
-                    result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
-                    result.error_string = fault
-                    self.get_logger().error(f"aborting trajectory: {fault}")
-                    goal_handle.abort(); return result
+                    return self._arm_abort(
+                        goal_handle, result, FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
+                        fault,
+                        elapsed=elapsed, desired=desired, actual=actual,
+                    )
                 if elapsed >= self.tracking_grace:
                     tracking_errors = [abs(a - d) for a, d in zip(actual, desired)]
                     if max(tracking_errors) > self.tracking_tolerance:
-                        result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
-                        result.error_string = (
-                            f"tracking error {max(tracking_errors):.3f} rad"
-                        )
-                        self.get_logger().error(
-                            f"aborting trajectory: {result.error_string}; "
-                            f"per_joint={[round(v, 4) for v in tracking_errors]}"
-                        )
                         self._publish_command(actual, latest_end, gripper)
-                        goal_handle.abort(); return result
+                        return self._arm_abort(
+                            goal_handle, result, FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
+                            f"tracking error {max(tracking_errors):.3f} rad",
+                            elapsed=elapsed, desired=desired, actual=actual,
+                        )
                     response_now = time.monotonic()
                     for index, (commanded, moved) in enumerate(
                         zip(
@@ -453,15 +553,12 @@ class OfficialTrajectoryAdapter(Node):
                             >= self.response_timeout
                             and moved < self.response_actual_delta
                         ):
-                            result.error_code = FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED
-                            result.error_string = (
-                                f"joint{index + 1} did not respond to position commands"
-                            )
-                            self.get_logger().error(
-                                f"aborting trajectory: {result.error_string}"
-                            )
                             self._publish_command(actual, latest_end, gripper)
-                            goal_handle.abort(); return result
+                            return self._arm_abort(
+                                goal_handle, result, FollowJointTrajectory.Result.PATH_TOLERANCE_VIOLATED,
+                                f"joint{index + 1} did not respond to position commands",
+                                elapsed=elapsed, desired=desired, actual=actual,
+                            )
                 self._publish_command(desired, latest_end, gripper)
                 command_count += 1
                 self._feedback(goal_handle, desired, actual)
@@ -472,6 +569,7 @@ class OfficialTrajectoryAdapter(Node):
             deadline = time.monotonic() + self.goal_time_tolerance
             final = points[-1][1]
             error = float("inf")
+            actual = None
             while time.monotonic() < deadline:
                 actual, latest_end, _, stamp = self.snapshot()
                 if actual is None or time.monotonic() - stamp > self.status_timeout:
@@ -484,21 +582,23 @@ class OfficialTrajectoryAdapter(Node):
                     result.error_code = FollowJointTrajectory.Result.SUCCESSFUL
                     goal_handle.succeed()
                     self.get_logger().info(
-                        f"trajectory complete: max error={error:.4f} rad, "
-                        f"commands={command_count} at {self.rate_hz:.1f} Hz"
+                        f"[ARM] ARM_SUCCESS t_ns={now_ns()} "
+                        f"elapsed={time.monotonic() - started:.3f} "
+                        f"max_error={error:.4f} commands={command_count}"
                     )
                     return result
                 time.sleep(period)
-            result.error_code = FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED
-            result.error_string = f"goal error {error:.3f} rad"
-            if actual is not None:
-                per_joint = [round(a - b, 4) for a, b in zip(actual, final)]
-                self.get_logger().error(
-                    f"trajectory goal tolerance violated: actual={[round(v, 4) for v in actual]} "
-                    f"target={[round(v, 4) for v in final]} error={per_joint}"
+            if actual is None:
+                return self._arm_abort(
+                    goal_handle, result, FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED,
+                    "official RobotStatus lost while settling on goal",
+                    elapsed=time.monotonic() - started, desired=final,
                 )
-            goal_handle.abort()
-            return result
+            return self._arm_abort(
+                goal_handle, result, FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED,
+                f"goal error {error:.3f} rad",
+                elapsed=time.monotonic() - started, desired=final, actual=actual,
+            )
         finally:
             self.goal_active = False
 

@@ -43,3 +43,4 @@ frames.pdf
 src/x5a_handeye/data/*
 !src/x5a_handeye/data/manual_samples_readonly.json
 !src/x5a_handeye/data/manual_samples_recalib_20260812.json
+!src/x5a_handeye/data/manual_samples_recalib_20260813b.json

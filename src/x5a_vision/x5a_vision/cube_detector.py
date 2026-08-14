@@ -114,10 +114,11 @@ class CubeDetector(Node):
             "object.size_z": 0.03,
             "table.z": -0.006,
             "table.top_tolerance": 0.03,
-            "workspace.x_min": 0.06,
-            "workspace.x_max": 0.44,
-            "workspace.y_min": 0.05,
-            "workspace.y_max": 0.58,
+            "workspace.x_min": 0.08,
+            "workspace.x_max": 0.41,
+            "workspace.y_min": 0.08,
+            "workspace.y_max": 0.48,
+            "workspace.r_max": 0.54,
             "workspace.z_min": -0.015,
             "workspace.z_max": 0.08,
             "workspace.expected_x": 0.20,
@@ -187,7 +188,7 @@ class CubeDetector(Node):
         self.table_tol = float(g("table.top_tolerance"))
         self.bounds = {
             key: float(g(f"workspace.{key}"))
-            for key in ("x_min", "x_max", "y_min", "y_max", "z_min", "z_max")
+            for key in ("x_min", "x_max", "y_min", "y_max", "r_max", "z_min", "z_max")
         }
         self.expected_xy = np.array(
             [float(g("workspace.expected_x")), float(g("workspace.expected_y"))]
@@ -327,6 +328,7 @@ class CubeDetector(Node):
             b["x_min"] <= p[0] <= b["x_max"]
             and b["y_min"] <= p[1] <= b["y_max"]
             and b["z_min"] <= p[2] <= b["z_max"]
+            and float(np.hypot(p[0], p[1])) <= b["r_max"]
         ):
             return None
         if abs(p[2] - (self.table_z + self.object_height)) > self.table_tol:
@@ -384,6 +386,7 @@ class CubeDetector(Node):
         if not (
             b["x_min"] <= p[0] <= b["x_max"]
             and b["y_min"] <= p[1] <= b["y_max"]
+            and float(np.hypot(p[0], p[1])) <= b["r_max"]
         ):
             return None
         p[2] = self.table_z

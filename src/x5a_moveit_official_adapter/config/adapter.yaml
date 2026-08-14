@@ -29,3 +29,7 @@
     gripper_finger_max_m: 0.044
     gripper_command_duration_sec: 0.8
     gripper_goal_tolerance_m: 0.004
+    # OPEN targets above this value must actually reach the target within
+    # tolerance, otherwise the goal is ABORTED. CLOSE targets stay lenient
+    # because a real grasp stops the fingers before 0 m.
+    gripper_open_threshold_m: 0.03

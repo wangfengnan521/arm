@@ -20,8 +20,10 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
 
 from geometry_msgs.msg import Pose, PoseStamped, Quaternion
 from control_msgs.action import GripperCommand
@@ -43,6 +45,7 @@ from moveit_msgs.srv import GetCartesianPath, GetPositionIK
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
 from shape_msgs.msg import SolidPrimitive
+from tf2_ros import Buffer, TransformListener
 from x5a_handeye.x5a_fk import fk_base_tool0
 
 
@@ -81,6 +84,33 @@ def pose_xyz_quat(
 
 def pose_to_xyz(pose: Pose) -> Tuple[float, float, float]:
     return (pose.position.x, pose.position.y, pose.position.z)
+
+
+def wrap_pi(angle: float) -> float:
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
+
+def unique_rpy(
+    candidates: Sequence[Sequence[float]], cap: int = 12
+) -> List[List[float]]:
+    out: List[List[float]] = []
+    for raw in candidates:
+        if len(raw) < 3:
+            continue
+        rpy = [wrap_pi(float(raw[0])), wrap_pi(float(raw[1])), wrap_pi(float(raw[2]))]
+        if any(
+            all(abs(wrap_pi(a - b)) < 0.05 for a, b in zip(rpy, existing))
+            for existing in out
+        ):
+            continue
+        out.append(rpy)
+        if len(out) >= cap:
+            break
+    return out
 
 
 class PickPlaceNode(Node):
@@ -140,6 +170,8 @@ class PickPlaceNode(Node):
         self.grasp_quat = rpy_to_quat(*self.grasp_rpy)
         self.transit_quat = rpy_to_quat(*self.transit_rpy)
         self.last_joints = None
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
 
         self.get_logger().info(
             f"pick_place ready plan_only={self.plan_only} vision={self.vision_enabled} "
@@ -206,6 +238,9 @@ class PickPlaceNode(Node):
         self.declare_parameter("gripper.timeout", 3.0)
         self.declare_parameter(
             "ready_joints", [-0.2, 0.3, 0.6, -0.3, 0.0, 0.0]
+        )
+        self.declare_parameter(
+            "pre_grasp_ready_joints", [0.0, 0.85, 0.95, -0.55, 0.0, 0.0]
         )
 
     def _load_params(self) -> None:
@@ -274,6 +309,9 @@ class PickPlaceNode(Node):
         self.gripper_max_effort = float(g("gripper.max_effort").value)
         self.gripper_timeout = float(g("gripper.timeout").value)
         self.ready_joints = [float(x) for x in g("ready_joints").value]
+        self.pre_grasp_ready_joints = [
+            float(x) for x in g("pre_grasp_ready_joints").value
+        ]
 
     def _joint_state_cb(self, msg: JointState) -> None:
         index = {name: i for i, name in enumerate(msg.name)}
@@ -581,6 +619,7 @@ class PickPlaceNode(Node):
         stage: str,
         velocity_scaling: float,
         acceleration_scaling: float,
+        try_pose_goal: bool = True,
     ) -> bool:
         assert self.q is not None
         # IK pre-solve for free-space pose goals, then joint-space plan (more reliable on this arm).
@@ -592,6 +631,8 @@ class PickPlaceNode(Node):
                 return True
         else:
             self.log_stage(stage + "_IK", planning="FAIL", reason="IK pre-solve failed")
+        if not try_pose_goal:
+            return False
         self.last_joints = list(self.q)
         self.get_logger().warn(
             f"{stage}: retry with Pose Goal from current joint state {self.last_joints}"
@@ -761,37 +802,59 @@ class PickPlaceNode(Node):
                 self.last_joints = list(self.q)
 
 
+    def ik_seeds(self, x: Optional[float] = None, y: Optional[float] = None) -> List[List[float]]:
+        seeds: List[List[float]] = []
+        if self.last_joints is not None:
+            seeds.append(list(self.last_joints))
+        if x is not None and y is not None:
+            yaw = math.atan2(y, x)
+            seeds.append([yaw, 0.85, 0.95, -0.55, 0.0, 0.0])
+        seeds.append(list(self.pre_grasp_ready_joints))
+        unique: List[List[float]] = []
+        for seed in seeds:
+            if len(seed) < 6:
+                continue
+            if any(
+                all(abs(a - b) < 1e-3 for a, b in zip(seed, existing))
+                for existing in unique
+            ):
+                continue
+            unique.append([float(v) for v in seed[:6]])
+        return unique[:3]
+
     def ik_joints_for_pose(self, pose: Pose) -> Optional[List[float]]:
         if not self.ik_cli.wait_for_service(timeout_sec=2.0):
             return None
-        seed = list(self.last_joints) if self.last_joints is not None else list(self.q or [0.0]*6)
+        seeds = self.ik_seeds(pose.position.x, pose.position.y)
         req = GetPositionIK.Request()
         req.ik_request.group_name = self.group
-        req.ik_request.robot_state.joint_state.name = list(ARM_JOINTS)
-        req.ik_request.robot_state.joint_state.position = seed
         ps = PoseStamped()
         ps.header.frame_id = self.base_frame
         ps.header.stamp = self.get_clock().now().to_msg()
         ps.pose = pose
         req.ik_request.pose_stamped = ps
-        req.ik_request.timeout.sec = 1
-        # Prefer collision-aware IK; if it fails (table/object padding), retry without collisions.
-        for avoid in (True, False):
+        req.ik_request.timeout.sec = 0
+        req.ik_request.timeout.nanosec = 200000000
+        # Collision-aware first, then one collision-unaware pass on the last seed.
+        attempts = [(seed, True) for seed in seeds]
+        attempts.append((seeds[-1], False))
+        for seed, avoid in attempts:
+            req.ik_request.robot_state.joint_state.name = list(ARM_JOINTS)
+            req.ik_request.robot_state.joint_state.position = seed
             req.ik_request.avoid_collisions = avoid
             fut = self.ik_cli.call_async(req)
-            if not self.wait_future(fut, 5.0):
+            if not self.wait_future(fut, 1.5):
                 continue
             res = fut.result()
-            if res and res.error_code.val == 1:
-                break
-        else:
-            return None
-        names = list(res.solution.joint_state.name)
-        pos = list(res.solution.joint_state.position)
-        try:
-            return [float(pos[names.index(n)]) for n in ARM_JOINTS]
-        except Exception:
-            return None
+            if not res or res.error_code.val != 1:
+                continue
+            names = list(res.solution.joint_state.name)
+            pos = list(res.solution.joint_state.position)
+            try:
+                return [float(pos[names.index(n)]) for n in ARM_JOINTS]
+            except Exception:
+                return None
+        return None
 
     def vertical_move(
         self,
@@ -834,6 +897,102 @@ class PickPlaceNode(Node):
 
     def make_transit_pose(self, x: float, y: float, z: float) -> Pose:
         return pose_xyz_quat(x, y, z, self.transit_quat)
+
+    def pose_rpy(self, x: float, y: float, z: float, rpy: Sequence[float]) -> Pose:
+        return pose_xyz_quat(x, y, z, rpy_to_quat(rpy[0], rpy[1], rpy[2]))
+
+    def grasp_orientation_candidates(self, x: float, y: float) -> List[List[float]]:
+        # Verified contact orientation first. Large radial yaw rotates the
+        # finger pads off a cube even when tool0 is on the visual point.
+        yaw0 = math.atan2(y, x)
+        pitch = float(self.grasp_rpy[1]) if len(self.grasp_rpy) > 1 else 1.45
+        cands = [list(self.grasp_rpy), [0.0, pitch, 0.20], [0.0, pitch, -0.20]]
+        if math.hypot(x, y) >= 0.42:
+            cands.extend([[0.0, pitch, yaw0], [0.0, 1.30, yaw0]])
+        return unique_rpy(cands)
+
+    def place_orientation_candidates(self, x: float, y: float) -> List[List[float]]:
+        yaw0 = math.atan2(y, x)
+        radius = math.hypot(x, y)
+        # Far +Y box succeeded at pitch 1.00; try that before the vertical set.
+        pitches = [1.00, 1.15, 1.30] if radius >= 0.42 else [1.15, 1.00, 1.30]
+        cands = [[0.0, pitch, yaw0] for pitch in pitches]
+        cands.append(list(self.transit_rpy))
+        return unique_rpy(cands, cap=4)
+
+    def move_pose_candidates(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        orientations: Sequence[Sequence[float]],
+        stage: str,
+        velocity_scaling: float,
+        acceleration_scaling: float,
+        xy_offsets: Optional[Sequence[Tuple[float, float]]] = None,
+    ) -> Optional[List[float]]:
+        offsets = list(xy_offsets) if xy_offsets is not None else [(0.0, 0.0)]
+        for ox, oy in offsets:
+            px, py = x + ox, y + oy
+            for index, rpy in enumerate(orientations):
+                pose = self.pose_rpy(px, py, z, rpy)
+                label = f"{stage}_{index + 1}"
+                self.log_stage(
+                    label + "_TRY",
+                    xyz=(px, py, z),
+                    rpy=[round(v, 3) for v in rpy],
+                )
+                last = (
+                    ox == offsets[-1][0]
+                    and oy == offsets[-1][1]
+                    and index == len(orientations) - 1
+                )
+                if self.move_pose(
+                    pose, label, velocity_scaling, acceleration_scaling,
+                    try_pose_goal=last,
+                ):
+                    return list(rpy)
+        return None
+
+    def move_pre_grasp_ready(self, x: float, y: float) -> bool:
+        joints = list(self.pre_grasp_ready_joints)
+        if len(joints) < 6:
+            joints = [0.0, 0.85, 0.95, -0.55, 0.0, 0.0]
+        joints[0] = math.atan2(y, x)
+        self.log_stage("MOVE_READY", joints=[round(v, 3) for v in joints])
+        return self.move_joints(
+            joints, "MOVE_READY", self.transit_vel, self.transit_acc
+        )
+
+    def log_calibration(self) -> None:
+        try:
+            from pathlib import Path
+
+            import yaml
+            from ament_index_python.packages import get_package_share_directory
+
+            path = Path(get_package_share_directory("x5a_handeye")) / "config" / "handeye_result.yaml"
+            data = yaml.safe_load(path.read_text())
+            hold = data.get("holdout_error", {})
+            samples = data.get("samples", {})
+            self.log_stage(
+                "HANDEYE",
+                file=str(path),
+                source=samples.get("source"),
+                solver=data.get("solver"),
+                holdout_mean_mm=round(float(hold.get("translation_mean_m", 0.0)) * 1000.0, 2),
+                holdout_max_mm=round(float(hold.get("translation_max_m", 0.0)) * 1000.0, 2),
+            )
+        except Exception as exc:
+            self.get_logger().warn(f"HANDEYE yaml unread: {exc}")
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "base_link", "camera_link", Time(), timeout=Duration(seconds=0.5)
+            )
+            t = tf.transform.translation
+            self.log_stage("TF_BASE_CAMERA_LINK", xyz=(t.x, t.y, t.z))
+        except Exception as exc:
+            self.get_logger().warn(f"TF base_link->camera_link unavailable: {exc}")
 
     def wait_for_frozen_vision(
         self,
@@ -890,6 +1049,7 @@ class PickPlaceNode(Node):
         if not self.wait_ready():
             self.get_logger().error("dependencies not ready")
             return 2
+        self.log_calibration()
 
         if self.vision_enabled:
             frozen = self.wait_for_frozen_vision()
@@ -914,34 +1074,31 @@ class PickPlaceNode(Node):
         place_z = self.place_z
         self.setup_scene()
 
-        pre_grasp = self.make_transit_pose(
-            grasp_x, grasp_y, grasp_z + self.pre_grasp_h
-        )
-        grasp = self.make_pose(grasp_x, grasp_y, grasp_z)
-        pre_place = self.make_transit_pose(
-            place_x, place_y, place_z + self.pre_place_h
-        )
-        # Keep one orientation throughout PRE_PLACE -> DESCEND.  Switching
-        # from the transit pitch to the grasp pitch during a nominally vertical
-        # descent can drive joint4 into its limit and truncate the Cartesian
-        # path even when the box position itself is reachable.
-        place = self.make_transit_pose(place_x, place_y, place_z)
+        grasp_oris = self.grasp_orientation_candidates(grasp_x, grasp_y)
+        place_oris = self.place_orientation_candidates(place_x, place_y)
         self.log_stage(
             "POSES", visual_top=(top_x, top_y, top_z),
             collision_center=(self.scene_obj_x, self.scene_obj_y, self.scene_obj_z),
-            pre_grasp=pose_to_xyz(pre_grasp), grasp=pose_to_xyz(grasp),
-            box_center_xy=(box_x, box_y), release=pose_to_xyz(place),
+            grasp_xyz=(grasp_x, grasp_y, grasp_z),
+            box_center_xy=(box_x, box_y),
+            release_z=place_z,
+            grasp_rpy_candidates=[[round(v, 3) for v in rpy] for rpy in grasp_oris],
+            place_rpy_candidates=[[round(v, 3) for v in rpy] for rpy in place_oris],
         )
 
         if not self.call_gripper(True):
             return 1
-        if not self.move_pose(
-            pre_grasp,
-            "MOVE_PRE_GRASP",
-            self.transit_vel,
-            self.transit_acc,
-        ):
+        if not self.move_pre_grasp_ready(grasp_x, grasp_y):
+            self.log_stage("MOVE_READY", result="WARN_CONTINUE")
+        # Approach and contact share one orientation. Switching pitch/yaw on
+        # the last 8 cm is what twisted the wrist and pinned joint4.
+        chosen_grasp = self.move_pose_candidates(
+            grasp_x, grasp_y, grasp_z + self.pre_grasp_h,
+            grasp_oris, "MOVE_PRE_GRASP", self.transit_vel, self.transit_acc,
+        )
+        if chosen_grasp is None:
             return 1
+        grasp = self.pose_rpy(grasp_x, grasp_y, grasp_z, chosen_grasp)
         # The visual object was used for scene construction. Remove it immediately
         # before contact so the gripper is allowed to enter the grasp volume.
         self.publish_box(
@@ -963,21 +1120,22 @@ class PickPlaceNode(Node):
         lift_start = pose_to_xyz(grasp) if self.plan_only else self.current_tcp()
         if lift_start is None:
             return 1
-        lift = self.make_transit_pose(
-            lift_start[0], lift_start[1], lift_start[2] + self.lift_h
+        lift = self.pose_rpy(
+            lift_start[0], lift_start[1], lift_start[2] + self.lift_h, chosen_grasp
         )
         ok, frac_lift = self.vertical_move(
             lift, "LIFT", self.lift_retreat_vel, self.lift_retreat_acc
         )
         if not ok:
             return 1
-        if not self.move_pose(
-            pre_place,
-            "MOVE_PRE_PLACE",
-            self.transit_vel,
-            self.transit_acc,
-        ):
+        chosen_place = self.move_pose_candidates(
+            place_x, place_y, place_z + self.pre_place_h,
+            place_oris, "MOVE_PRE_PLACE", self.transit_vel, self.transit_acc,
+            xy_offsets=[(0.0, 0.0), (0.01, 0.0), (0.0, -0.01)],
+        )
+        if chosen_place is None:
             return 1
+        place = self.pose_rpy(place_x, place_y, place_z, chosen_place)
         ok, frac_desc = self.vertical_move(
             place, "DESCEND", self.precision_vel, self.precision_acc
         )
@@ -990,8 +1148,9 @@ class PickPlaceNode(Node):
         retreat_start = pose_to_xyz(place) if self.plan_only else self.current_tcp()
         if retreat_start is None:
             return 1
-        retreat = self.make_transit_pose(
-            retreat_start[0], retreat_start[1], retreat_start[2] + self.retreat_h
+        retreat = self.pose_rpy(
+            retreat_start[0], retreat_start[1], retreat_start[2] + self.retreat_h,
+            chosen_place,
         )
         ok, frac_ret = self.vertical_move(
             retreat, "RETREAT", self.lift_retreat_vel, self.lift_retreat_acc

@@ -6,6 +6,13 @@ moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControll
 moveit_simple_controller_manager:
   controller_names:
     - x5a_arm_controller
+    - x5a_gripper_controller
+
+  # The official adapter accepts one finger position in meters. joint7 and
+  # joint8 mirror the same measured position, so command only joint7; enabling
+  # the parallel-jaw sum would incorrectly send twice the verified opening.
+  command_joint: joint7
+  parallel: false
 
   x5a_arm_controller:
     type: FollowJointTrajectory
@@ -18,3 +25,11 @@ moveit_simple_controller_manager:
       - joint4
       - joint5
       - joint6
+
+  x5a_gripper_controller:
+    type: GripperCommand
+    action_ns: gripper_cmd
+    default: true
+    joints:
+      - joint7
+      - joint8

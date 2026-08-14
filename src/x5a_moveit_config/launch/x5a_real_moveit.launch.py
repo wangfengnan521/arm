@@ -99,6 +99,9 @@ def generate_launch_description():
         parameters=[
             moveit_config.to_dict(),
             {
+                # Humble MTC Task::execute() sends complete solutions through
+                # this capability; controller selection remains in MoveIt.
+                "capabilities": "move_group/ExecuteTaskSolutionCapability",
                 "publish_robot_description_semantic": True,
                 "allow_trajectory_execution": True,
                 "publish_planning_scene": True,

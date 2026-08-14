@@ -45,10 +45,14 @@
       z: -0.006
       top_tolerance: 0.030
     workspace:
-      x_min: 0.06
-      x_max: 0.44
-      y_min: 0.05
-      y_max: 0.58
+      # Trimmed to the collision-free grasp IK envelope from
+      # logs/reachability_20260813_160829.txt (y=0.55 row and the far
+      # +X/+Y corner have no IK under the sampled grasp family).
+      x_min: 0.08
+      x_max: 0.41
+      y_min: 0.08
+      y_max: 0.48
+      r_max: 0.54
       z_min: -0.015
       z_max: 0.080
       expected_x: 0.20

@@ -22,6 +22,8 @@ setup(
     entry_points={
         "console_scripts": [
             "official_trajectory_adapter = x5a_moveit_official_adapter.official_trajectory_adapter:main",
+            "x5a_gripper_test = x5a_moveit_official_adapter.gripper_test:main",
+            "joint_range_calibrate = x5a_moveit_official_adapter.joint_range_calibrate:main",
         ]
     },
 )

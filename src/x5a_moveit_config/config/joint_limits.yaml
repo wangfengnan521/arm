@@ -36,6 +36,10 @@ joint_limits:
     has_position_limits: true
     # X5A hardware commissioning: joint4 stopped near -1.2915 rad while the
     # older X5 software limit allowed unreachable trajectories below it.
+    # 2026-08-13 C-execution confirmed the active stop at -1.2911 rad (goal
+    # -1.3450 never reached), so this value matches the ACTIVE hardware
+    # range; the passive hand-sweep (-1.647 rad, gravity mode) does not
+    # apply to servo-controlled motion. Keep -1.28.
     min_position: -1.28
     max_position: 1.55
   joint5:

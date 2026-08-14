@@ -31,8 +31,8 @@
     <joint name="joint6" value="0.0"/>
   </group_state>
   <group_state name="open" group="gripper">
-    <joint name="joint7" value="0.03"/>
-    <joint name="joint8" value="0.03"/>
+    <joint name="joint7" value="0.044"/>
+    <joint name="joint8" value="0.044"/>
   </group_state>
   <group_state name="closed" group="gripper">
     <joint name="joint7" value="0.0"/>
